@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+
+# Debug & temporary files
+debug/
+ufs/debug/
+*.html
+
+# Generated PDFs
+pdfs/
+ufs/pdfs_*/
+ufs/downloads_*/
+
+# Environment / secrets
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# Archives & old builds
+archive/
+*.zip
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Mappings cache (gerado em runtime)
+mappings/
+
+# Lock files
+requirements.lock.txt
+
+# Rules / Skills / Workflow (interno)
+rules/
+skills/
+workflow/
+PRD/
+tools/
