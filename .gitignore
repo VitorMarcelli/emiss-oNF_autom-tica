@@ -1,50 +1,31 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
-
-# Virtual environment
+# Ambiente Virtual
 .venv/
-venv/
 
-# Debug & temporary files
+# Variáveis de ambiente
+.env
+
+# Python (temp files e caches)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Diretórios de logs e debug
 debug/
 ufs/debug/
-*.html
+*.log
 
-# Generated PDFs
+# Diretórios de PDFs gerados localmente (teste)
 pdfs/
+ufs/pdfs/
+pdfs_*/
 ufs/pdfs_*/
-ufs/downloads_*/
 
-# Environment / secrets
-.env
-*.env
+# Arquivos temporários e dumps
+*.txt
+!requirements.txt
+!requirements.lock.txt
+pr_test_result.txt
 
-# IDE
-.vscode/
-.idea/
-
-# Archives & old builds
-archive/
-*.zip
-
-# OS
-Thumbs.db
+# OS generated files
 .DS_Store
-
-# Mappings cache (gerado em runtime)
-mappings/
-
-# Lock files
-requirements.lock.txt
-
-# Rules / Skills / Workflow (interno)
-rules/
-skills/
-workflow/
-PRD/
-tools/
+Thumbs.db

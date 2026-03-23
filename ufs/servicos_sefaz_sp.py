@@ -2,22 +2,28 @@
 Módulo — Emissão de DARE (ICMS) para São Paulo (SP).
 Portal: https://www4.fazenda.sp.gov.br/DareICMS/
 
-⚠️ LIMITAÇÃO IMPORTANTE:
-  O portal de SP implementa CAPTCHA visual obrigatório após a consulta
-  do CNPJ/CPF. O fluxo automatizado consegue:
-    - Acessar a página e obter cookies
-    - Enviar a consulta do CNPJ/CPF via AJAX
-  Porém, o portal responde com {"requiresV2": true} exigindo resolução
-  manual de captcha antes de popular os campos do DARE.
+⚠️ LIMITAÇÃO ARQUITETURAL:
+  O portal de SP implementa CAPTCHA visual dinâmico após a consulta
+  do CNPJ/CPF em certas instâncias.
+  
+  O módulo de SP suporta:
+    - Automação via Client-Side Bypass na API de validação AJAX (quando aplicável).
+    - Orquestração completa do DARE se os desafios invisíveis forem transpostos.
+    
+  O módulo de SP NÃO suporta e FALHARÁ EXPLICITAMENTE se:
+    - O Portal travar a concessão do token exigindo intervenção visual intransponível.
+    - Neste caso de falha rígida (Hard Fail), a orquestração depende estritamente 
+      da implementação de um serviço de quebra de captcha (Captcha Solver de terceiros)
+      via configuração de ambiente. Não provemos "fallback humano" ou modo semi-assistido.
 
-  Alternativa: emissão semi-automática — o módulo prepara a sessão e
-  valida entradas, mas reporta a limitação de captcha quando encontrada.
-
-Fluxo mapeado via DevTools/Network (04/03/2026):
   1. GET  /DareICMS/DareAvulso                              → página SPA (cookies)
   2. POST /DareICMS/DareAvulso/btnConsultar_Click/{CNPJ}    → consulta (AJAX)
      → resposta pode ser {"requiresV2": true} exigindo captcha
   3. POST /DareICMS/DareAvulso/ValidarCaptcha               → valida captcha manual
+  3A.POST /DareICMS/DareAvulso/btnCalcular_Click/           → recálculo de juros automáticos
+      (O cálculo na SEFAZ SP é ativado mecanicamente por essa rota. Não requer
+       flags de 'autoCalc=true' no payload da guia, apenas o trânsito dos valores
+       recalculados para a etapa subsequente).
   4. POST /DareICMS/DareAvulso/GerarDare                    → gera DARE (AJAX)
   5. GET  /DareICMS/DareAvulso/ImprimirDare                 → download PDF
 
@@ -214,9 +220,9 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
     """
     Emite DARE de ICMS para São Paulo.
 
-    ⚠️ O portal exige CAPTCHA visual obrigatório após consulta do CNPJ.
-    Se o portal exigir captcha intransponível, o módulo
-    retorna erro explicativo com a etapa e alternativa.
+    ⚠️ O portal possui barreiras de CAPTCHA visual. Se o bypass injetado falhar,
+    o módulo falhará formalmente alertando a necessidade técnica de um Captcha Solver.
+    Não há fallback para intervenção humana ou fluxo híbrido.
 
     Args:
         session: Instância de requests.Session (opcional).
@@ -232,12 +238,11 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
     cnpj_cpf = dados_emissao.get("cnpj_cpf", "")
     codigo_receita = dados_emissao.get("receita_codigo", "")
     referencia = dados_emissao.get("referencia", "")
-    valor = dados_emissao.get("valor", "10.00")
-    if isinstance(valor, str):
-        try:
-            valor = float(valor.replace(".", "").replace(",", "."))
-        except:
-            valor = 10.00
+    valor_cru = dados_emissao.get("valor", 0.0)
+    try:
+        valor = float(str(valor_cru).replace(",", ".")) if valor_cru else 0.0
+    except ValueError:
+        valor = 0.0
             
     ie = dados_emissao.get("ie", "")
     
@@ -250,11 +255,16 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
     if not referencia:
         referencia = datetime.now().strftime("%m/%Y")
         
-    data_vencimento_str = dados_emissao.get("data_vencimento", datetime.now().strftime("%d/%m/%Y"))
+    data_vencimento_str = dados_emissao.get("data_vencimento", "")
+    
+    if not codigo_receita or not referencia or not data_vencimento_str or float(valor) <= 0:
+        return False, "etapa: validar_entrada | motivo: campos obrigatórios ausentes | detalhe: receita_codigo, referencia, data_vencimento e valor (>0) são obrigatórios"
+        
     try:
         data_venc_obj = datetime.strptime(data_vencimento_str, "%d/%m/%Y")
     except ValueError:
-        data_venc_obj = datetime.today()
+        return False, "etapa: validar_entrada | motivo: formato de data invalido | detalhe: data_vencimento precisa ser DD/MM/AAAA"
+        
     data_venc_iso = data_venc_obj.strftime("%Y-%m-%d")
 
     try:
@@ -284,6 +294,8 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         # Checar CAPTCHA na página inicial
         captcha, msg_captcha = checar_captcha_e_retornar(resp, "SP", "pagina_inicial")
         if captcha:
+            if not os.environ.get("TWOCAPTCHA_API_KEY"):
+                return False, _normalizar_erro("validar_ambiente", "solver não configurado", "Variável TWOCAPTCHA_API_KEY ausente no .env. Solver é obrigatório para transpor bloqueios ativos na SEFAZ SP.")
             return False, msg_captcha
 
         # Extrair sitekey para possível uso posterior
@@ -320,13 +332,16 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             
             # Se mesmo assim retornar erro, capturamos
             if _detectar_captcha(resp):
+                if not os.environ.get("TWOCAPTCHA_API_KEY"):
+                    return False, _normalizar_erro("validar_ambiente", "solver não configurado", "Variável TWOCAPTCHA_API_KEY ausente no .env. O portal bloqueou o acesso e requer resolução formal de Captcha.")
+                    
                 snapshot = salvar_snapshot_captcha(resp, "SP", "consultar_contribuinte")
                 return False, _normalizar_erro(
                     "consultar_contribuinte",
                     "captcha detectado",
                     f"portal bloqueou a consulta mesmo com o bypass direto | "
                     f"snapshot: {snapshot} | "
-                    f"alternativa: emissão manual.",
+                    f"solução: configuração de Captcha Solver externo exigida.",
                 )
 
         # Verificar resposta da consulta
@@ -370,9 +385,24 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
                 codigo_servico_dare = int(rec.get("codigoServicoDARE", 0))
                 break
         
-        # Fallback para o primeiro serviço disponível caso a string exata mude
-        if not codigo_servico_dare and data_consulta.get("possiveisReceitas"):
-            codigo_servico_dare = int(data_consulta["possiveisReceitas"][0].get("codigoServicoDARE", 0))
+        if not codigo_servico_dare:
+            opcoes_validas = []
+            for rec in data_consulta.get("possiveisReceitas", []):
+                nome_bruto = str(rec.get("nome", "")).strip()
+                if nome_bruto:
+                    opcoes_validas.append(f"[{nome_bruto}]")
+            
+            if opcoes_validas:
+                lista_str = " | ".join(opcoes_validas)
+                detalhe_msg = f"A receita solicitada ('{codigo_receita}') não foi encontrada na Sefaz. Opções válidas/liberadas para esta inscrição: {lista_str}"
+            else:
+                detalhe_msg = f"A receita solicitada ('{codigo_receita}') não foi encontrada e o portal não liberou NENHUMA receita avulsa para este contribuinte."
+
+            return False, _normalizar_erro(
+                "selecionar_receita",
+                "código de receita incompatível ou não liberado ao contribuinte atual",
+                detalhe_msg
+            )
 
         payload_dare = {
             "inscricaoEstadual": ie or data_consulta.get("inscricaoEstadual", ""),
@@ -401,9 +431,39 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             "valorTotal": float(valor)
         }
 
-        # Submete requisição final JSON no botão Gerar
+        # ── Etapa 3A: Atualizando encargos da guia (Recálculo) ────────
         headers_url = {**HEADERS_AJAX, "Referer": URL_AVULSO}
         headers_url["Content-Type"] = "application/json; charset=UTF-8"
+        
+        logger.info("Etapa 3A: Calculando juros e multas (se aplicáveis)")
+        resp_calc = session.post(
+            URL_AVULSO + "/btnCalcular_Click/",
+            json=payload_dare,
+            headers=headers_url,
+            timeout=20,
+        )
+        resp_calc.raise_for_status()
+        
+        try:
+            data_calc = resp_calc.json()
+            # Só atualiza e confia se a mensagem de erro estiver limpa e os campos numéricos vierem
+            campo_erro_calc = data_calc.get("erro")
+            if not campo_erro_calc or (isinstance(campo_erro_calc, dict) and campo_erro_calc.get("estaOk", True) is True):
+                if "valorJuros" in data_calc and "valorMulta" in data_calc and "valorTotal" in data_calc:
+                    payload_dare["valorJuros"] = data_calc["valorJuros"]
+                    payload_dare["valorMulta"] = data_calc["valorMulta"]
+                    payload_dare["valorTotal"] = data_calc["valorTotal"]
+                    logger.info("Valores recalculados pelo portal: Juros=R$%.2f | Multa=R$%.2f | Total=R$%.2f", 
+                                data_calc["valorJuros"], data_calc["valorMulta"], data_calc["valorTotal"])
+            else:
+                detalhe_erro = str(campo_erro_calc)[:200]
+                logger.warning("Falha bloqueante ao efetuar mock financeiro via /btnCalcular_Click/. Detalhe da API: %s", detalhe_erro)
+                return False, _normalizar_erro("calcular_encargos", "O portal SP rejeitou o recálculo dos juros/multa para a data de vencimento exigida.", detalhe_erro)
+        except ValueError:
+            return False, _normalizar_erro("calcular_encargos", "Resposta de recálculo não-JSON (possível instabilidade na SEFAZ-SP)")
+        
+        # ── Etapa 3B: Geração Transacional ────────────────────────────
+        # Submete requisição final JSON no botão Gerar
 
         resp = session.post(
             URL_AVULSO + "/btnGerar_Click/",
@@ -459,6 +519,11 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             caminho, nome_arquivo = _baixar_pdf(resp_pdf, path_pdf)
         except ValueError as exc:
             return False, str(exc)
+
+        try: from .pdf_utils import validar_pdf
+        except ImportError: from pdf_utils import validar_pdf
+        is_valido, msg_val = validar_pdf(caminho)
+        if not is_valido: return False, _normalizar_erro("validar_pdf_final", "falha de autenticidade (0 bytes ou HTML)", msg_val)
 
         logger.info("Emissão concluída: %s", caminho)
         return True, {
@@ -649,6 +714,9 @@ def listar_receitas(session=None, salvar_cache=True) -> dict:
             resp_ajax.raise_for_status()
             
             if _detectar_captcha(resp_ajax):
+                if not os.environ.get("TWOCAPTCHA_API_KEY"):
+                    raise ValueError("etapa: validar_ambiente | motivo: solver não configurado | detalhe: Variável TWOCAPTCHA_API_KEY ausente no .env. Solver é obrigatório.")
+                    
                 debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "debug")
                 os.makedirs(debug_dir, exist_ok=True)
                 with open(os.path.join(debug_dir, "SP_captcha_listagem.html"), "w", encoding="utf-8") as f:
@@ -698,25 +766,31 @@ def listar_receitas(session=None, salvar_cache=True) -> dict:
 # Teste embutido
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    print("=" * 60)
+    print("  TESTE DIRETO — Emissão de DARE (ICMS) — SP")
+    print("=" * 60)
+    if not os.getenv("TWOCAPTCHA_API_KEY"):
+        print("[!] AVISO IMPORTANTE: A chave TWOCAPTCHA_API_KEY não foi encontrada no .env")
+        print("    A execução para São Paulo falhará no momento da resolução do reCAPTCHA.")
+    
     # CNPJ público de SP para testes (Bradesco)
     CNPJ_TESTE = "51.789.601/0001-66"
     PASTA_PDF = "./pdfs_sp"
 
-    print("=" * 60)
-    print("  TESTE — Emissão de DARE (ICMS) — SP")
-    print("=" * 60)
-    print()
-    print("  🚀 Bypass Nativo Ativo: CAPTCHA evadido com sucesso via Client-Side")
-    print("  Este teste validará se a SEFAZ aceita o CNPJ informado.")
-    print()
-
+    # Este payload obedece estritamente ao CONTRATO_SP (sem fallbacks destrutivos)
     dados_emissao = {
-        "cnpj_cpf": CNPJ_TESTE,
-        "receita_codigo": "046",
+        "cnpj_cpf": "51.789.601/0001-66",
+        "receita_codigo": "04601",
+        "referencia": "02/2026",
         "valor": 10.00,
         "data_vencimento": "23/03/2026"
     }
     
+    print(f"\n[>] Iniciando motor SP com CNPJ {CNPJ_TESTE}...\n")
     sucesso, resultado = emitir(
         session=None,
         dados_emissao=dados_emissao,
@@ -724,13 +798,8 @@ if __name__ == "__main__":
     )
 
     if sucesso:
-        print(f"\n✅ SUCESSO")
-        print(f"   PDF: {resultado['pdf_path']}")
-        print(f"   Nome: {resultado['pdf_filename']}")
+        print(f"\n[SUCESSO] Guia Emitida!")
+        print(f"  -> PDF Salvo em: {resultado['pdf_path']}")
     else:
-        print(f"\n❌ ERRO DE NEGÓCIO SEFAZ: {resultado}")
-        print("\n💡 NOTA: O Bypass de CAPTCHA funcionou! Este erro refere-se "
-              "à falta de débitos compatíveis com a competência ou I.E. "
-              "informadas para o CNPJ de teste.")
-
+        print(f"\n[FALHA] A automação foi interrompida:\n  -> Motivo: {resultado}")
     print("=" * 60)

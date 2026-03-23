@@ -12,10 +12,15 @@ Portal: https://portal.sefaz.go.gov.br/
   Para OUTROS tipos de ICMS (ICMS-ST, Avulso, Auto de Infração), existe
   a possibilidade via portal público, mas também podem exigir login.
 
-Fluxo possível (DARE público, quando disponível):
-  1. GET  portal público → tela de emissão (cookies + hidden fields)
-  2. POST dados do contribuinte e receita
-  3. POST/GET → geração do PDF
+CONTRATO DE ENTRADA (dados_emissao):
+  Principais campos exigidos para emissão:
+  - ie_cnpj: Inscrição Estadual ou CNPJ.
+  - receita_codigo: Código da receita (ex: "108" para Normal).
+  - valor: Valor do documento (> 0).
+  - referencia: Período base da apuração no formato MM/AAAA.
+  - tipo_referencia: OBRIGATÓRIO (valores aceitos: "diaria" ou "complementar").
+       * "diaria": seleciona o Dia atual como Detalhe de Apuração.
+       * "complementar": seleciona automaticamente a opção 'Complementar' no Detalhe de Apuração.
 
 Retorno padronizado:
   Sucesso: True, {"mensagem": "ok", "pdf_path": "...", "pdf_filename": "..."}
@@ -161,6 +166,7 @@ def _validar_entradas(
     codigo_receita: str,
     referencia: str,
     valor: float,
+    tipo_referencia: str,
 ) -> None:
     if not ie_cnpj or not ie_cnpj.strip():
         raise ValueError(
@@ -175,6 +181,13 @@ def _validar_entradas(
             _normalizar_erro(
                 "validar_entrada",
                 "referência inválida (esperado MM/AAAA)",
+            )
+        )
+    if not tipo_referencia or tipo_referencia.lower() not in ["diaria", "complementar"]:
+        raise ValueError(
+            _normalizar_erro(
+                "validar_entrada",
+                "tipo_referencia inválido ou ausente (esperado 'diaria' ou 'complementar')",
             )
         )
     if valor <= 0:
@@ -238,6 +251,7 @@ def _emitir_via_playwright(
     pdf_path: str,
     codigo_receita: str,
     referencia: str,
+    tipo_referencia: str,
     data_vencimento: str,
     valor: float,
     data_pagamento: str = "",
@@ -375,46 +389,120 @@ def _emitir_via_playwright(
                 page.wait_for_selector(".ui-tree", timeout=10000)
                 page.wait_for_timeout(500)
 
-                # Nível 1: expandir "ICMS - NORMAL" (node_0)
-                toggler_0 = page.locator("#frmEmissao\\:apReceitaEstadual\\:treeReceita_node_0 > div .ui-tree-icon").first
-                toggler_0.click(timeout=5000)
-                page.wait_for_timeout(800)
+                # Expansão via JavaScript direto — contorna problemas de seletores
+                # PrimeFaces no Playwright. Abre todos os nós necessários via DOM nativo.
+                logger.info("Playwright: Expandindo árvore via JavaScript (3 níveis)")
+                
+                expand_result = page.evaluate("""() => {
+                    const results = [];
+                    
+                    function expandNode(nodeId) {
+                        const node = document.getElementById(nodeId);
+                        if (!node) return "NOT_FOUND: " + nodeId;
+                        
+                        // Forçar visibilidade do próprio nó
+                        node.style.display = '';
+                        
+                        // Encontrar o toggler (span com classe que contém 'triangle' ou 'toggler')
+                        const contentDiv = node.querySelector(':scope > div, :scope > .ui-treenode-content');
+                        if (!contentDiv) return "NO_CONTENT_DIV: " + nodeId;
+                        
+                        const toggler = contentDiv.querySelector(
+                            '.ui-tree-toggler, .ui-tree-icon, [class*="triangle"], [class*="toggler"]'
+                        );
+                        
+                        if (toggler) {
+                            // Simular clique real com todos os handlers
+                            toggler.click();
+                        }
+                        
+                        // Forçar visibilidade dos filhos (ul container)
+                        const childContainer = node.querySelector(':scope > ul, :scope > .ui-treenode-children');
+                        if (childContainer) {
+                            childContainer.style.display = 'block';
+                        }
+                        
+                        return "OK: " + nodeId;
+                    }
+                    
+                    // Prefixo do ID da árvore
+                    const prefix = 'frmEmissao:apReceitaEstadual:treeReceita_node_';
+                    
+                    // Expandir nível 1: ICMS - NORMAL
+                    results.push(expandNode(prefix + '0'));
+                    
+                    // Expandir nível 2: 1 - ICMS - IMPOSTO...
+                    results.push(expandNode(prefix + '0_0'));
+                    
+                    // Expandir nível 3: 108 - NORMAL
+                    results.push(expandNode(prefix + '0_0_0'));
+                    
+                    return results;
+                }""")
+                
+                logger.info("Playwright: Resultado expansão JS: %s", expand_result)
+                
+                # Verificar se algum nó não foi encontrado
+                for r in (expand_result or []):
+                    if "NOT_FOUND" in str(r):
+                        return False, _normalizar_erro(
+                            "selecionar_receita",
+                            "nó da árvore não encontrado no DOM",
+                            f"Resultado da expansão JS: {expand_result}"
+                        )
+                
+                page.wait_for_timeout(2000)
 
-                # Nível 2: expandir "1 - ICMS - IMPOSTO..." (node_0_0)
-                toggler_0_0 = page.locator("#frmEmissao\\:apReceitaEstadual\\:treeReceita_node_0_0 > div .ui-tree-icon").first
-                toggler_0_0.click(timeout=5000)
-                page.wait_for_timeout(800)
-
-                # Nível 3: expandir "108 - NORMAL" (node_0_0_0)
-                toggler_0_0_0 = page.locator("#frmEmissao\\:apReceitaEstadual\\:treeReceita_node_0_0_0 > div .ui-tree-icon").first
-                toggler_0_0_0.click(timeout=5000)
-                page.wait_for_timeout(800)
-
-                # Nível 4: selecionar folha "0 - Diário" (node_0_0_0_0)
-                leaf = page.locator("#frmEmissao\\:apReceitaEstadual\\:treeReceita_node_0_0_0_0 .ui-tree-node-label").first
-                leaf.click(timeout=5000)
+                # Nível 4: selecionar folha baseada no tipo de referência
+                # Mapeamento explícito conforme árvore real do portal:
+                #   diaria       -> "0 - Diário"
+                #   complementar -> "400 - Complementar"
+                if tipo_referencia.lower() == "diaria":
+                    texto_folha_esperado = "0 - Di"      # match parcial seguro
+                    texto_folha_log = "0 - Diário"
+                else:
+                    texto_folha_esperado = "400 - Complementar"
+                    texto_folha_log = "400 - Complementar"
+                
+                logger.info("Playwright: Procurando nó-folha '%s' na árvore", texto_folha_log)
+                
+                # Buscar dentro do pai node_0_0_0 (108 - NORMAL)
+                pai_locator = page.locator("#frmEmissao\\:apReceitaEstadual\\:treeReceita_node_0_0_0")
+                leaf = pai_locator.locator(".ui-treenode-label, .ui-tree-node-label", has_text=re.compile(re.escape(texto_folha_esperado), re.IGNORECASE)).first
+                
+                if leaf.count() == 0:
+                    # Busca global como segunda tentativa (sem fallback arbitrário)
+                    logger.warning("Nó '%s' não encontrado no pai direto, buscando em toda a árvore", texto_folha_log)
+                    leaf = page.locator(".ui-treenode-label, .ui-tree-node-label", has_text=re.compile(re.escape(texto_folha_esperado), re.IGNORECASE)).first
+                
+                if leaf.count() == 0:
+                    return False, _normalizar_erro(
+                        "selecionar_receita",
+                        "nó obrigatório não encontrado na árvore",
+                        f"O nó '{texto_folha_log}' não foi localizado na árvore de receitas do portal GO. Verifique se a receita/IE possui esse tipo de apuração."
+                    )
+                
+                leaf.click(timeout=10000)
                 page.wait_for_timeout(1000)
 
-                logger.info("Playwright: Receita selecionada na árvore, continuando")
+                # ── Readback: confirmar visualmente o que foi selecionado ──
+                texto_selecionado = leaf.inner_text()
+                logger.info("Playwright: Nó efetivamente selecionado na árvore = '%s'", texto_selecionado)
+                
+                if texto_folha_esperado.lower() not in texto_selecionado.lower():
+                    return False, _normalizar_erro(
+                        "selecionar_receita",
+                        "nó selecionado divergente do esperado",
+                        f"Esperado: '{texto_folha_log}' | Selecionado: '{texto_selecionado}'"
+                    )
+
+                logger.info("Playwright: Receita '%s' confirmada na árvore. Clicando Continue.", texto_selecionado)
                 page.locator("button[id*='btnContinueBaixo']").click()
                 page.wait_for_timeout(3000)
 
             except (PwTimeout, Exception) as exc:
-                logger.warning("Playwright: Falha na seleção da árvore (%s), tentativa com seletor genérico", str(exc)[:100])
-                # Fallback: tentar expandir todos os nós e clicar no primeiro leaf
-                try:
-                    togglers = page.locator(".ui-tree-icon.ui-icon-triangle-1-e").all()
-                    for tog in togglers[:4]:
-                        tog.click(timeout=5000)
-                        page.wait_for_timeout(600)
-                    # Selecionar primeiro nó-folha visível
-                    leaf = page.locator(".ui-tree-item .ui-tree-node-label").first
-                    leaf.click(timeout=5000)
-                    page.wait_for_timeout(1000)
-                    page.locator("button[id*='btnContinueBaixo']").click()
-                    page.wait_for_timeout(3000)
-                except Exception as exc2:
-                    return False, _normalizar_erro("selecionar_receita", "falha ao selecionar receita na árvore do portal", str(exc2)[:200])
+                logger.error("Playwright: Falha FATAL na seleção da árvore de receitas: %s", str(exc)[:200])
+                return False, _normalizar_erro("selecionar_receita", "falha ao selecionar receita na árvore do portal", str(exc)[:200])
 
             # ── Passo 5: Formulário financeiro ───────────────────────────
             # Agora o portal deve mostrar os campos: Mês, Ano, Data Vencimento,
@@ -503,15 +591,46 @@ def _emitir_via_playwright(
 
             page.wait_for_timeout(1000)
 
-            # Se for Diário, preencher o Detalhe com o dia atual (ex: "17 - Dia 17")
-            try:
-                hoje = datetime.now()
-                dia_str = str(hoje.day)
+            # Preencher Detalhe de Apuração — OBRIGATÓRIO para ambos os tipos
+            if tipo_referencia.lower() == "diaria":
+                try:
+                    hoje = datetime.now()
+                    dia_str = str(hoje.day)
+                    
+                    logger.info("Playwright: Tentando forçar Detalhe Apuração=%s (Diária)", dia_str)
+                    pf_set_value("cbDetalheApuracao", dia_str)
+                except Exception as e:
+                    logger.warning("Playwright: Erro ao tentar detalhe apuração: %s", str(e))
+            else:
+                # Para Complementar: o nó '400 - Complementar' já foi selecionado
+                # na árvore. O dropdown cbDetalheApuracao pode NÃO existir neste
+                # formulário, pois a árvore já definiu o detalhe de apuração.
+                dropdown_existe = page.evaluate("""() => {
+                    const panels = document.querySelectorAll('.ui-selectonemenu-panel');
+                    for (let p of panels) {
+                        if (p.id && p.id.indexOf('cbDetalheApuracao') > -1) return true;
+                    }
+                    return false;
+                }""")
                 
-                logger.info("Playwright: Tentando forçar Detalhe Apuração=%s", dia_str)
-                pf_set_value("cbDetalheApuracao", dia_str)
-            except Exception as e:
-                logger.warning("Playwright: Erro ao tentar detalhe apuração: %s", str(e))
+                if dropdown_existe:
+                    logger.info("Playwright: Dropdown cbDetalheApuracao encontrado — selecionando '400 - Complementar'.")
+                    ok = pf_set_value("cbDetalheApuracao", "400")
+                    if not ok:
+                        ok = pf_set_value("cbDetalheApuracao", "Complementar")
+                    if not ok:
+                        ok = pf_set_value("cbDetalheApuracao", "400 - Complementar")
+                    if ok:
+                        page.wait_for_timeout(500)
+                        label_sel = page.evaluate("""() => {
+                            const l = document.querySelector("[id$='cbDetalheApuracao_label']");
+                            return l ? l.innerText : "N/A";
+                        }""")
+                        logger.info("Playwright: Detalhe de Apuração efetivamente selecionado = '%s'", label_sel)
+                    else:
+                        logger.warning("Playwright: Não foi possível setar '400' no dropdown, mas a árvore já definiu complementar.")
+                else:
+                    logger.info("Playwright: Dropdown cbDetalheApuracao NÃO existe no formulário — árvore já definiu '400 - Complementar'. Prosseguindo.")
 
             # Preencher campos de data e valor (inputs simples PrimeFaces) via JavaScript
             page.evaluate("""(dados) => {
@@ -536,6 +655,14 @@ def _emitir_via_playwright(
             })
             page.wait_for_timeout(1000)
             logger.info("Playwright: Datas e valor preenchidos")
+
+            # ── Log de resumo pré-geração ──────────────────────────────
+            logger.info("Playwright: RESUMO PRÉ-GERAÇÃO:")
+            logger.info("  Receita = %s (código: %s)", MAPEAMENTO_RECEITAS_GO.get(codigo_receita, "N/A"), codigo_receita)
+            logger.info("  Tipo Referência = %s", tipo_referencia)
+            logger.info("  Referência = %s", referencia)
+            logger.info("  Valor = %s", valor_str)
+            logger.info("  Vencimento = %s | Pagamento = %s", data_vencimento, data_pagamento or data_vencimento)
 
             # Interceptar callback exibirDare para extrar o DARE, caso abra via popup interno
             page.evaluate("""() => {
@@ -655,6 +782,7 @@ def preparar_modo_assistido(
     ie_cnpj: str,
     codigo_receita: str = "108",
     referencia: str = "",
+    tipo_referencia: str = "",
     data_vencimento: str = "",
     valor: float = 10.00,
     data_pagamento: str = "",
@@ -667,13 +795,11 @@ def preparar_modo_assistido(
     complemento: str = "",
     bairro: str = "",
 ) -> ResultadoEmissao:
-    if not referencia:
-        referencia = datetime.now().strftime("%m/%Y")
     if not data_vencimento:
         data_vencimento = datetime.now().strftime("%d/%m/%Y")
 
     try:
-        _validar_entradas(ie_cnpj, codigo_receita, referencia, valor)
+        _validar_entradas(ie_cnpj, codigo_receita, referencia, valor, tipo_referencia)
     except ValueError as exc:
         return False, str(exc)
 
@@ -685,6 +811,7 @@ def preparar_modo_assistido(
             "ie_cnpj": ie_cnpj,
             "codigo_receita": codigo_receita,
             "referencia": referencia,
+            "tipo_referencia": tipo_referencia,
             "data_vencimento": data_vencimento,
             "data_pagamento": data_pagamento or data_vencimento,
             "valor": float(valor),
@@ -750,9 +877,10 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         dados_emissao = {}
         
     ie_cnpj = dados_emissao.get("ie") or dados_emissao.get("ie_cnpj") or dados_emissao.get("cnpj", "")
-    codigo_receita = str(dados_emissao.get("receita_codigo", "108"))
+    codigo_receita = str(dados_emissao.get("receita_codigo", "")).strip()
     referencia = dados_emissao.get("referencia", "")
-    data_vencimento = dados_emissao.get("data_vencimento") or datetime.now().strftime("%d/%m/%Y")
+    tipo_referencia = dados_emissao.get("tipo_referencia", "")
+    data_vencimento = dados_emissao.get("data_vencimento", "")
     data_pagamento = dados_emissao.get("data_pagamento", "")
     detalhe_receita = dados_emissao.get("historico", "")
     modo_assistido = dados_emissao.get("modo_assistido", False)
@@ -764,21 +892,20 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
     complemento = dados_emissao.get("complemento", "")
     bairro = dados_emissao.get("bairro", "")
 
-    valor = dados_emissao.get("valor", 10.00)
-    if isinstance(valor, str):
-        try: valor_float = float(valor.replace(".", "").replace(",", "."))
-        except: valor_float = 10.00
-    else:
-        valor_float = float(valor)
+    valor_cru = dados_emissao.get("valor", 0.0)
+    try: 
+        valor_float = float(str(valor_cru).replace(",", ".")) if valor_cru else 0.0
+    except ValueError: 
+        valor_float = 0.0
+        
+    if not codigo_receita or not tipo_referencia or not referencia or not data_vencimento or valor_float <= 0:
+        return False, "etapa: validar_entrada | motivo: obrigatorios nulos | detalhe: receita, tipo_ref, referencia, dt_venc ou valor invalidos"
         
     if not path_pdf:
         path_pdf = "./pdfs_go"
         
-    if not referencia:
-        referencia = datetime.now().strftime("%m/%Y")
-        
     try:
-        _validar_entradas(ie_cnpj, codigo_receita, referencia, valor_float)
+        _validar_entradas(ie_cnpj, codigo_receita, referencia, valor_float, tipo_referencia)
     except ValueError as exc:
         return False, str(exc)
 
@@ -787,6 +914,7 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             ie_cnpj=ie_cnpj,
             codigo_receita=codigo_receita,
             referencia=referencia,
+            tipo_referencia=tipo_referencia,
             data_vencimento=data_vencimento,
             valor=valor_float,
             data_pagamento=data_pagamento,
@@ -808,6 +936,7 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             pdf_path=path_pdf,
             codigo_receita=codigo_receita,
             referencia=referencia,
+            tipo_referencia=tipo_referencia,
             data_vencimento=data_vencimento,
             valor=valor_float,
             data_pagamento=data_pagamento,
@@ -911,6 +1040,11 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             try: caminho, nome_arquivo = _baixar_pdf(resp, path_pdf)
             except ValueError as exc: return False, str(exc)
 
+        try: from .pdf_utils import validar_pdf
+        except ImportError: from pdf_utils import validar_pdf
+        is_valido, msg_val = validar_pdf(caminho)
+        if not is_valido: return False, _normalizar_erro("validar_pdf_final", "arquivo nulo/corrompido", msg_val)
+
         logger.info("Emissão concluída: %s", caminho)
         return True, {
             "mensagem": "ok",
@@ -926,20 +1060,34 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         session.close()
 
 if __name__ == "__main__":
+    print("=" * 60)
+    print("  TESTE DIRETO — Emissão de DARE (ICMS) — GO")
+    print("=" * 60)
+    print("[!] AVISO: GO utiliza processamento direto HTTP (Requests). Sem restrição por Captcha.\n")
+
     IE_TESTE = "10.123.456-7"
     PASTA_PDF = "./pdfs_go"
-    print("=" * 60)
-    print("  TESTE — Emissão de DARE (ICMS) — GO")
-    print("=" * 60)
+
+    # Este payload obedece estritamente ao CONTRATO_GO (sem fallbacks destrutivos)
+    dados_emissao = {
+    "ie_cnpj": "10.472.034-4",
+    "receita_codigo": "108",
+    "tipo_referencia": "complementar",
+    "referencia": "01/2026",
+    "data_vencimento": "23/03/2026",
+    "data_pagamento": "23/03/2026",
+    "valor": 500.00
+    }
+    
+    print(f"[>] Iniciando motor GO com CNPJ/IE {dados_emissao['ie_cnpj']}...\n")
     sucesso, resultado = emitir(
-        dados_emissao={
-            "ie_cnpj": IE_TESTE,
-            "receita_codigo": "108",
-            "valor": 10.00
-        },
+        dados_emissao=dados_emissao,
         path_pdf=PASTA_PDF
     )
+    
     if sucesso:
-        print(f"\n[OK] SUCESSO: {resultado['pdf_path']}")
+        print(f"\n[SUCESSO] Guia Emitida!")
+        print(f"  -> PDF Salvo em: {resultado['pdf_path']}")
     else:
-        print(f"\n[ERRO] {resultado}")
+        print(f"\n[FALHA] A automação foi interrompida:\n  -> Motivo: {resultado}")
+    print("=" * 60)

@@ -1,159 +1,109 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white" />
-  <img src="https://img.shields.io/badge/Playwright-Automation-2EAD33?style=for-the-badge&logo=playwright&logoColor=white" />
-  <img src="https://img.shields.io/badge/Status-Produção-brightgreen?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/UFs-7_Estados-blue?style=for-the-badge" />
-</p>
+# Emissão de Guias ICMS — Motor por UF
 
-<h1 align="center">⚡ Emissão Automática de Guias ICMS</h1>
+Automatiza a emissão de guias de ICMS (DARE, DAE, GR-PR, DAR-1) nos portais
+estaduais, gerando PDFs prontos para pagamento.
 
-<p align="center">
-  <strong>Motor inteligente que automatiza a emissão de guias de recolhimento de ICMS diretamente nos portais das Secretarias da Fazenda estaduais — gerando PDFs prontos para pagamento em segundos.</strong>
-</p>
-
-<p align="center">
-  <em>Transformando horas de trabalho manual repetitivo em uma única linha de comando.</em>
-</p>
-
----
-
-## 🎯 O Problema
-
-Profissionais de contabilidade e departamentos fiscais gastam **horas por mês** acessando manualmente os portais de cada Secretaria da Fazenda para emitir guias de ICMS. Cada estado tem um portal diferente, com formulários distintos, fluxos complexos e — muitas vezes — bloqueios de CAPTCHA que tornam o processo ainda mais demorado.
-
-**E se um único comando pudesse fazer tudo isso por você?**
-
-## 💡 A Solução
-
-Este motor automatiza **todo o fluxo** de emissão: desde a autenticação no portal, preenchimento de formulários, resolução inteligente de CAPTCHAs, até o download do PDF final — tudo 100% programático.
-
-```
-run_windows.bat SP --receita 4601 --cnpj 12345678000199 --valor 100,00 --mes 03 --ano 2026
-```
-
-**Uma linha. Um PDF. Pronto para pagamento. ✅**
-
----
-
-## 🗺️ Estados Suportados
-
-| UF | Guia | Método | CAPTCHA | Status |
-|----|------|--------|---------|--------|
-| 🟢 **São Paulo** | DARE-SP | HTTP Direto | Bypass nativo | ✅ Produção |
-| 🟢 **Minas Gerais** | DAE-MG | HTTP Direto | Sem bloqueio | ✅ Produção |
-| 🟢 **Mato Grosso** | DAR-1-MT | HTTP Direto | Sem bloqueio | ✅ Produção |
-| 🟢 **Goiás** | DARE-GO | Playwright | PrimeFaces bypass | ✅ Produção |
-| 🟢 **Paraná** | GR-PR | Playwright + HTTP | reCAPTCHA Enterprise | ✅ Produção |
-| 🟢 **Mato Grosso do Sul** | DARE-MS | Playwright | Automação direta | ✅ Produção |
-| 🔵 **Outros** | — | — | — | Em planejamento |
-
----
-
-## ⚙️ Arquitetura
-
-```
-emissao_nf_junes/
-│
-├── ufs/                        # 🧠 Módulos por estado
-│   ├── servicos_sefaz_sp.py    #     São Paulo
-│   ├── servicos_sefaz_mg.py    #     Minas Gerais
-│   ├── servicos_sefaz_mt.py    #     Mato Grosso
-│   ├── servicos_sefaz_go.py    #     Goiás
-│   ├── servicos_sefaz_pr.py    #     Paraná
-│   ├── servicos_sefaz_ms.py    #     Mato Grosso do Sul
-│   ├── captcha_utils.py        #     Utilitários de CAPTCHA
-│   └── solver_2captcha.py      #     Integração 2Captcha
-│
-├── docs/                       # 📚 Documentação técnica
-├── run_windows.bat             # 🚀 Script de execução
-├── setup_windows.bat           # 📦 Instalação automatizada
-└── requirements.txt            # 📋 Dependências Python
-```
-
-Cada módulo em `ufs/` é **auto-contido** e segue uma interface padronizada:
-
-```python
-# Todos os módulos exportam a mesma assinatura
-sucesso, resultado = emitir(session, dados_emissao, path_pdf)
-# → True,  {"pdf_path": "...", "pdf_filename": "..."}
-# → False, "etapa: X | motivo: Y | detalhe: Z"
-```
-
----
-
-## 🚀 Início Rápido
-
-### 1. Pré-requisitos
+## Pré-requisitos
 
 - **Windows 10/11**
-- **Python 3.10+** (com "Add Python to PATH" marcado na instalação)
+- **Python 3.10+** instalado e disponível no terminal (`python --version`)
+  - Na instalação do Python, marque a caixa **"Add Python to PATH"**
 
-### 2. Instalação
+## Instalação
 
-```bash
+Execute uma única vez no terminal (CMD ou PowerShell):
+
+```
 setup_windows.bat
 ```
 
-O script configura tudo automaticamente: ambiente virtual, dependências e navegador headless.
+O script irá:
+1. Criar um ambiente virtual isolado (`.venv`)
+2. Instalar as dependências
+3. Baixar o navegador Chromium headless (usado internamente)
+4. Validar que tudo está pronto
 
-### 3. Uso
+Se tudo der certo, você verá `[SUCESSO] Ambiente configurado corretamente!`
 
-**Listar receitas disponíveis:**
+> **Redes corporativas:** Se o pip ou o Playwright falharem por proxy/firewall,
+> configure as variáveis `HTTP_PROXY` e `HTTPS_PROXY` no sistema ou execute
+> a instalação em uma rede sem restrições.
 
-```bash
+## Como usar
+
+### Listar receitas disponíveis de uma UF
+
+```
 run_windows.bat SP --listar-receitas
+run_windows.bat MT --listar-receitas
+run_windows.bat MG --listar-receitas
+run_windows.bat PR --listar-receitas
 run_windows.bat GO --listar-receitas
 ```
 
-**Emitir uma guia:**
+O resultado é salvo em `mappings/<UF>.json` para consulta e cache.
 
-```bash
+### Emitir uma guia
+
+```
 run_windows.bat SP --receita 4601 --cnpj 12345678000199 --valor 100,00 --mes 03 --ano 2026
-run_windows.bat GO --receita 108 --ie 10410432-5 --valor 100,00 --mes 03 --ano 2026
+run_windows.bat MT --receita 1112 --ie 133201040 --valor 100,00 --mes 03 --ano 2026
+run_windows.bat MG --receita 121-7 --cnpj 06230790400078 --valor 100,00 --mes 03 --ano 2026
+run_windows.bat PR --receita 1015 --ie 9023307399 --valor 10,00 --mes 03 --ano 2026
+run_windows.bat GO --receita 121 --ie 10123456-7 --valor 100,00 --mes 03 --ano 2026
 ```
 
----
+### Usar cache antes de emitir
 
-## 📋 Parâmetros
+```
+run_windows.bat SP --usar-cache --receita 4601 --cnpj 12345678000199 --valor 100,00 --mes 03 --ano 2026
+```
+
+O flag `--usar-cache` valida o código da receita contra o arquivo `mappings/<UF>.json`
+antes de acessar o portal.
+
+### Parâmetros disponíveis
 
 | Parâmetro | Descrição |
 |-----------|-----------|
-| `UF` | Sigla do estado (SP, MT, MG, PR, GO, MS) |
-| `--listar-receitas` | Lista todas as receitas disponíveis no portal |
-| `--usar-cache` | Valida a receita contra cache local antes de acessar o portal |
+| `UF` | Sigla do estado (SP, MT, MG, PR, GO) |
+| `--listar-receitas` | Gera o catálogo de receitas do portal |
+| `--usar-cache` | Valida receita contra cache local |
 | `--receita` | Código da receita/tributo |
 | `--cnpj` | CNPJ do contribuinte |
 | `--ie` | Inscrição Estadual |
 | `--valor` | Valor da guia (ex: 100,00) |
-| `--mes` / `--ano` | Período de referência |
-| `--juros` / `--multa` / `--correcao` | Acréscimos (quando aplicável) |
-| `--pdf-dir` | Diretório personalizado para salvar os PDFs |
+| `--mes` | Mês de referência (MM) |
+| `--ano` | Ano de referência (AAAA) |
+| `--juros` | Valor de juros (quando aplicável) |
+| `--multa` | Valor de multa (quando aplicável) |
+| `--correcao` | Correção monetária (quando aplicável) |
+| `--pdf-dir` | Diretório personalizado para os PDFs |
 
----
+## Onde ficam os resultados
 
-## 🔐 Sobre CAPTCHAs
+| Local | Conteúdo |
+|-------|----------|
+| `pdfs/<UF>/` | PDFs das guias emitidas |
+| `mappings/<UF>.json` | Cache das receitas disponíveis |
+| `debug/` | Snapshots de erro para diagnóstico |
 
-O motor utiliza diferentes estratégias por estado:
+## Se der erro
 
-- **SP** — Bypass nativo via endpoint secundário de validação
-- **GO** — Contorno via automação Playwright em componentes PrimeFaces
-- **PR** — Integração com serviço 2Captcha para reCAPTCHA Enterprise (requer variável `TWOCAPTCHA_API_KEY`)
-- **MT, MG, MS** — Portais sem bloqueio por CAPTCHA
+1. Copie a linha de erro completa exibida no terminal
+2. Verifique se existe arquivo de debug em `debug/<UF>_ultima_resposta.html`
+3. Envie ambos para análise
 
----
+Erro típico:
+```
+etapa: <nome> | motivo: <causa> | detalhe: <informação extra>
+```
 
-## 🤝 Contribuição
+## Limitações conhecidas
 
-Contribuições são bem-vindas! Se você trabalha com automação fiscal e deseja adicionar suporte a novos estados, sinta-se à vontade para abrir uma PR.
-
----
-
-## ⚖️ Aviso Legal
-
-Este projeto é uma **ferramenta de automação para fins legítimos** — projetada para agilizar o trabalho de profissionais de contabilidade e departamentos fiscais que já realizam essas operações manualmente. O uso deve estar em conformidade com os termos de uso dos portais estaduais e com a legislação vigente.
-
----
-
-<p align="center">
-  Feito com ☕ e Python por <strong>Vitor Marcelli</strong>
-</p>
+| UF | Observação |
+|----|------------|
+| PR | Exige reCaptcha Enterprise — fluxo suportado via variável de ambiente TWOCAPTCHA_API_KEY |
+| GO | Fluxo via Playwright (PrimeFaces) |
+| SP | Bypass nativo do captcha implementado (funciona automaticamente) |
+| MT, MG | Portais públicos sem bloqueio observado |

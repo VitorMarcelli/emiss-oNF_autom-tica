@@ -178,45 +178,50 @@ def _baixar_pdf(
 # ---------------------------------------------------------------------------
 # Função pública — emitir
 # ---------------------------------------------------------------------------
-def emitir(
-    ie: str,
-    pdf_path: str,
-    codigo_tributo: str = "310",
-    opcao: str = "Nao",
-    referencia: str = "",
-    data_pagamento: str = "",
-    valor: float = 10.00,
-    historico: str = "ICMS NORMAL",
-    tipo_identificacao: str = "IE",
-    razao_social: str = "",
-    vencimento: str = "1",
-) -> ResultadoEmissao:
+def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "", **kwargs) -> ResultadoEmissao:
     """
     Emite DAEMS de ICMS para Mato Grosso do Sul.
 
     Args:
-        ie: Inscrição Estadual (formato XX.XXX.XXX-X ou só dígitos).
-        pdf_path: Caminho (diretório ou arquivo) para salvar o PDF.
-        codigo_tributo: Código do tributo (ex: "310" = ICMS Normal).
-        opcao: "Sim" (interestadual) ou "Nao" (interno).
-        referencia: Período de referência no formato MM/AAAA.
-        data_pagamento: Data de pagamento no formato DD/MM/AAAA.
-        valor: Valor do tributo (> 0).
-        historico: Texto descritivo para o campo Histórico.
-        tipo_identificacao: "IE", "CPF" ou "CNPJ".
-        razao_social: Razão social (preenchida automaticamente se IE válida).
-        vencimento: Código do tipo de vencimento ("1" = Mensal).
+        session: Sessão requests (opcional, criada internamente se ausente).
+        dados_emissao: Dicionário com dados de emissão (interface padrão).
+        path_pdf: Caminho (diretório ou arquivo) para salvar o PDF.
 
     Returns:
         Tuple[bool, dict | str]: (True, info_dict) ou (False, erro_string).
     """
-    # Defaults dinâmicos
-    if not referencia:
-        agora = datetime.now()
-        referencia = agora.strftime("%m/%Y")
-    if not data_pagamento:
-        data_pagamento = datetime.now().strftime("%d/%m/%Y")
+    if dados_emissao is None:
+        dados_emissao = {}
 
+    ie = dados_emissao.get("ie") or dados_emissao.get("ie_cnpj") or dados_emissao.get("cad_icms", "")
+    codigo_tributo = dados_emissao.get("receita_codigo", "")
+    referencia = dados_emissao.get("referencia", "")
+    data_vencimento_payload = dados_emissao.get("data_vencimento", "")
+    data_pagamento = dados_emissao.get("data_pagamento") or data_vencimento_payload
+    historico = dados_emissao.get("historico", "ICMS NORMAL")
+    opcao = dados_emissao.get("opcao", "Nao")
+    tipo_identificacao = dados_emissao.get("tipo_identificacao", "IE")
+    razao_social = dados_emissao.get("razao_social", "")
+    vencimento_prop = "1" # Operacional padrao MS DAEMS para Vencimento Mensal
+
+    valor_cru = dados_emissao.get("valor", 0.0)
+    if isinstance(valor_cru, str):
+        try:
+            valor = float(valor_cru.replace(".", "").replace(",", "."))
+        except Exception:
+            valor = 0.0
+    else:
+        try:
+            valor = float(valor_cru)
+        except (ValueError, TypeError):
+            valor = 0.0
+
+    pdf_path = path_pdf or "./pdfs_ms"
+
+    # Strict Validation Sem Defaults Ocultos
+    if not data_pagamento:
+        return False, _normalizar_erro("validar_entrada", "data_vencimento ou data_pagamento ausentes no payload", "O MS exige uma representacao de data de vencimento/pagamento. Nao recriamos dias padroes do sistema.")
+        
     try:
         _validar_entradas(ie, codigo_tributo, referencia, valor)
     except ValueError as exc:
@@ -231,7 +236,8 @@ def emitir(
     # Formatar valor no padrão brasileiro
     valor_str = f"{valor:.2f}".replace(".", ",")
 
-    session = requests.Session()
+    if session is None:
+        session = requests.Session()
     session.headers.update(HEADERS_NAV)
 
     try:
@@ -283,12 +289,12 @@ def emitir(
             "tipoDocumento": tipo_doc,
             "documento": ie_formatada,
             "razaoSocial": razao_social,
-            "vencimento": vencimento,
+            "vencimento": vencimento_prop,
             "referencia": referencia,
             "dataPagamento": data_pagamento,
             "valor": valor_str,
             "Historico1": historico,
-            "tipoVencimento": vencimento,
+            "tipoVencimento": vencimento_prop,
         }
 
         resp = session.post(
@@ -344,13 +350,13 @@ def emitir(
             "tributo": codigo_tributo,
             "documento": ie_formatada,
             "razaoSocial": razao_social,
-            "vencimento": vencimento,
+            "vencimento": vencimento_prop,
             "referencia": referencia,
             "dataPagamento": data_pagamento,
             "valor": valor_str,
             "Historico1": historico,
             "operacao": "1",
-            "tipoVencimento": vencimento,
+            "tipoVencimento": vencimento_prop,
             "EmailEnvioDaems": "",
         }
 
@@ -393,6 +399,14 @@ def emitir(
         except ValueError as exc:
             return False, str(exc)
 
+        # Validação Final Transversal de PDF (Correção 17)
+        try: from .pdf_utils import validar_pdf
+        except ImportError: from pdf_utils import validar_pdf
+        
+        is_valido, msg_val = validar_pdf(caminho)
+        if not is_valido:
+            return False, _normalizar_erro("validar_pdf_final", "PDF falso ou corrompido", msg_val)
+
         logger.info("Emissão concluída com sucesso: %s", caminho)
         return True, {
             "mensagem": "ok",
@@ -420,27 +434,33 @@ def emitir(
 # Teste embutido
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # IE pública do MS para testes
+    print("=" * 60)
+    print("  TESTE DIRETO — Emissão de DAEMS (ICMS) — MS")
+    print("=" * 60)
+    print("[!] AVISO: MS utiliza rotas HTTP diretas. Não exige Captcha.\n")
+
     IE_TESTE = "28.348.179-0"
     PASTA_PDF = "./pdfs_ms"
 
-    print("=" * 60)
-    print("  TESTE — Emissão de DAEMS (ICMS) — MS")
-    print("=" * 60)
+    # Este payload obedece estritamente ao CONTRATO_MS
+    dados_emissao = {
+        "ie": IE_TESTE,
+        "receita_codigo": "310",
+        "referencia": "12/2026",
+        "data_vencimento": "15/01/2027",
+        "valor": 10.00,
+        "historico": "TESTE ICMS NORMAL"
+    }
 
+    print(f"[>] Iniciando motor MS com IE {IE_TESTE}...\n")
     sucesso, resultado = emitir(
-        ie=IE_TESTE,
-        pdf_path=PASTA_PDF,
-        codigo_tributo="310",
-        valor=10.00,
-        historico="TESTE ICMS NORMAL",
+        dados_emissao=dados_emissao,
+        path_pdf=PASTA_PDF,
     )
 
     if sucesso:
-        print(f"\n✅ SUCESSO")
-        print(f"   PDF: {resultado['pdf_path']}")
-        print(f"   Nome: {resultado['pdf_filename']}")
+        print(f"\n[SUCESSO] Guia Emitida!")
+        print(f"  -> PDF Salvo em: {resultado['pdf_path']}")
     else:
-        print(f"\n❌ ERRO: {resultado}")
-
+        print(f"\n[FALHA] A automação foi interrompida:\n  -> Motivo: {resultado}")
     print("=" * 60)

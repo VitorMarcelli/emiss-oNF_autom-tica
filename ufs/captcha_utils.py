@@ -180,8 +180,8 @@ def erro_captcha_padronizado(
     if snapshot_path:
         detalhe += f" | snapshot: {snapshot_path}"
     detalhe += (
-        f" | alternativa: acesse o portal da SEFAZ-{uf} manualmente "
-        f"e emita a guia/PDF pelo navegador"
+        f" | solução: configuração de Captcha Solver externo exigida "
+        f"(variável TWOCAPTCHA_API_KEY)"
     )
 
     msg = f"etapa: {etapa} | motivo: captcha detectado | detalhe: {detalhe}"

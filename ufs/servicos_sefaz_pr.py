@@ -13,6 +13,16 @@ Fluxo mapeado via DevTools/Network (API REST JSON):
    de captcha válido, a emissão automatizada pura pode ser bloqueada. Nesse caso,
    o módulo retornará erro explicativo com sugestão de alternativa.
 
+CONTRATO DE ENTRADA (dados_emissao):
+  Principais campos exigidos:
+  - ie_cnpj / cad_icms: (obrigatório) CAD/ICMS, IE ou CNPJ do estado.
+  - receita_codigo: (obrigatório) Código numérico interno exato do tributo (ex: "1015").
+    O PR **NÃO** aceita o nome textual ou label (ex: "ICMS NORMAL"). Deve ser apenas número.
+    O motor requer correspondência **exata**. Não há fallback ("escolher qualquer um") na árvore do portal.
+  - valor: (obrigatório) Formato numérico.
+  - referencia: (obrigatório) MM/AAAA. Sem default automático.
+  - unidade_gestora: Padrão "990000" (SEFA/PR) para guias de ICMS estaduais.
+
 Retorno padronizado:
   Sucesso: True, {"mensagem": "ok", "pdf_path": "...", "pdf_filename": "..."}
   Erro:    False, "etapa: <nome> | motivo: <causa> | detalhe: <curto>"
@@ -22,7 +32,7 @@ import logging
 import re
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Tuple, Union
 
@@ -129,12 +139,21 @@ def _baixar_pdf(
     pdf_path: str,
 ) -> Tuple[str, str]:
     content_type = resp.headers.get("Content-Type", "")
-    if "application/pdf" not in content_type.lower():
+    content_bytes = resp.content
+    
+    if len(content_bytes) == 0:
+        raise ValueError(
+            _normalizar_erro("validar_pdf", "documento gerado possui 0 KB (vazio)")
+        )
+        
+    is_real_pdf = content_bytes[:5] == b"%PDF-"
+    if not is_real_pdf:
+        snippet = content_bytes[:100].decode(errors="ignore").replace("\r", " ").replace("\n", " ").strip()
         raise ValueError(
             _normalizar_erro(
-                "baixar_pdf",
-                "resposta não é PDF",
-                f"content-type={content_type}",
+                "validar_pdf",
+                "o arquivo retornado não é um PDF válido",
+                f"O portal retornou HTML ou lixo. Snippet: {snippet}"
             )
         )
 
@@ -153,9 +172,9 @@ def _baixar_pdf(
     if destino.is_dir() or not str(destino).lower().endswith(".pdf"):
         destino = destino / filename
     destino.parent.mkdir(parents=True, exist_ok=True)
-    destino.write_bytes(resp.content)
+    destino.write_bytes(content_bytes)
 
-    logger.info("PDF salvo em %s (%d bytes)", destino, len(resp.content))
+    logger.info("PDF salvo e verificado em %s (%d bytes)", destino, len(content_bytes))
     return str(destino), filename
 
 
@@ -195,7 +214,17 @@ def _select_vue_multiselect(page, input_selector: str, search_text: str, timeout
     page.wait_for_timeout(800)
 
     option = container.locator(f".multiselect__option:has-text('{search_text}')").first
-    option.wait_for(state="visible", timeout=5000)
+    try:
+        option.wait_for(state="visible", timeout=4000)
+    except Exception:
+        raise ValueError(
+            _normalizar_erro(
+                "selecionar_receita",
+                f"opção exata '{search_text}' não encontrada no dropdown",
+                "Certifique-se de usar o código ou nome exato do tributo conforme o portal do PR. A automação não tentará adivinhar a opção."
+            )
+        )
+    
     option.click()
     page.wait_for_timeout(500)
 
@@ -255,9 +284,7 @@ def _emitir_via_playwright(
             cad_limpo = re.sub(r'\D', '', cad_icms)
             
             target_type = "CNPJ" if len(cad_limpo) == 14 else ("CPF" if len(cad_limpo) == 11 else None)
-            _dbg = Path(__file__).resolve().parent / "debug"
-            _dbg.mkdir(parents=True, exist_ok=True)
-            with open(_dbg / "pr_form.html", "w", encoding="utf-8") as f:
+            with open("pr_form.html", "w", encoding="utf-8") as f:
                 f.write(page.locator("form, .container, body").first.inner_html())
             if target_type:
                 try:
@@ -296,7 +323,7 @@ def _emitir_via_playwright(
             btn_avancar2.click(force=True)
             page.wait_for_timeout(5000)
 
-            debug_path = Path(__file__).resolve().parent / "debug" / "pr_playwright_step3.png"
+            debug_path = Path("debug") / "pr_playwright_step3.png"
             debug_path.parent.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(debug_path))
 
@@ -311,51 +338,79 @@ def _emitir_via_playwright(
                 btn_emitir = page.locator("button.btn-success, button:has-text('Emitir Guia')").first
                 btn_emitir.wait_for(state="visible", timeout=15000)
                 btn_emitir.click()
-                page.wait_for_timeout(5000)
 
-                agora = datetime.now().strftime("%Y%m%d_%H%M%S")
-                destino = Path(pdf_path)
-                if destino.is_dir() or not str(destino).lower().endswith(".pdf"):
-                    destino = destino / f"GRPR_PR_{agora}.pdf"
-                destino.parent.mkdir(parents=True, exist_ok=True)
-                filename = destino.name
-
-                btn_pdf = page.locator("button:has-text('Salvar PDF'), a:has-text('Salvar PDF')").first
                 pdf_capturado = False
+                
+                # O PR renderiza a guia dentro de um iframe (/html/id)
+                iframe_el = page.locator("iframe[src*='emissao-grpr/html/']").first
+                try:
+                    iframe_el.wait_for(state="visible", timeout=25000)
+                    iframe_src = iframe_el.get_attribute("src")
+                    
+                    if iframe_src:
+                        # Montar URL absoluta
+                        if iframe_src.startswith("/"):
+                            # BASE_URL é "https://emitirgrpr.sefa.pr.gov.br/arrecadacao/"
+                            # iframe_src é "/arrecadacao/api/..."
+                            absolute_url = "https://emitirgrpr.sefa.pr.gov.br" + iframe_src
+                        else:
+                            absolute_url = iframe_src
 
-                if btn_pdf.is_visible(timeout=10000):
-                    try:
-                        with page.expect_download(timeout=15000) as download_info:
-                            btn_pdf.click()
-                        download = download_info.value
-                        filename = download.suggested_filename or filename
-                        if not str(destino).lower().endswith(".pdf"):
-                            destino = destino.parent / filename
-                        download.save_as(str(destino))
-                        pdf_capturado = True
-                    except Exception:
-                        pass
-
-                if not pdf_capturado:
-                    try:
-                        pdf_bytes = page.pdf(
+                        # Imprimir apenas o conteudo da guia num PDF limpo
+                        print_page = context.new_page()
+                        print_page.goto(absolute_url, timeout=30000)
+                        print_page.wait_for_load_state("networkidle", timeout=15000)
+                        
+                        agora = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        destino = Path(pdf_path)
+                        if destino.is_dir() or not str(destino).lower().endswith(".pdf"):
+                            destino = destino / f"GRPR_PR_{agora}.pdf"
+                        destino.parent.mkdir(parents=True, exist_ok=True)
+                        filename = destino.name
+                        
+                        print_page.pdf(
+                            path=str(destino),
                             format="A4",
                             print_background=True,
-                            margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"},
+                            margin={"top": "1cm", "right": "1cm", "bottom": "1cm", "left": "1cm"}
                         )
-                        destino.write_bytes(pdf_bytes)
+                        print_page.close()
                         pdf_capturado = True
-                    except Exception:
-                        pass
+                except Exception as exc:
+                    pass
+
+                if not pdf_capturado:
+                    error_shot = Path("debug/pr_erro_pdf.png")
+                    error_shot.parent.mkdir(exist_ok=True, parents=True)
+                    try: page.screenshot(path=str(error_shot))
+                    except: pass
+                    try:
+                        with open("debug/pr_erro_pdf.html", "w", encoding="utf-8") as f:
+                            f.write(page.content())
+                    except: pass
+                    
+                    return False, _normalizar_erro(
+                        "gerar_pdf_playwright", 
+                        "PDF real bloqueado ou timeout", 
+                        "A interceptação da API e o botão de download falharam. O PR não entregou o arquivo PDF."
+                    )
 
                 if pdf_capturado:
+                    # Validando tamanho
+                    t_bytes = destino.stat().st_size
+                    if t_bytes == 0:
+                        return False, _normalizar_erro("validar_pdf", "PDF originou arquivo vazio de 0KB")
+                        
+                    # Validar Header PDF
+                    with open(destino, "rb") as f:
+                        if f.read(5) != b"%PDF-":
+                            return False, _normalizar_erro("validar_pdf", "Download corrompido, assinatura %PDF- ausente na raiz do Playwright download.")
+                    
                     return True, {
                         "mensagem": "ok",
                         "pdf_path": str(destino),
                         "pdf_filename": filename,
                     }
-                else:
-                    return False, _normalizar_erro("gerar_pdf_playwright", "falha captura PDF", "Screenshot gravada.")
 
             except PwTimeout:
                 return False, _normalizar_erro("emitir_guia_playwright", "botão 'Emitir Guia' ausente", "Screenshot...")
@@ -462,23 +517,34 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         dados_emissao = {}
         
     cad_icms = dados_emissao.get("ie") or dados_emissao.get("ie_cnpj") or dados_emissao.get("cad_icms", "")
-    codigo_arrecadacao = dados_emissao.get("receita_codigo", "1015")
-    referencia = dados_emissao.get("referencia", "")
-    data_pagamento = dados_emissao.get("data_pagamento") or dados_emissao.get("data_vencimento") or datetime.now().strftime("%d/%m/%Y")
+    codigo_arrecadacao = dados_emissao.get("receita_codigo")
+    if not codigo_arrecadacao:
+        return False, _normalizar_erro("validar_entrada", "campo 'receita_codigo' é obrigatório no PR")
+        
+    if not str(codigo_arrecadacao).isdigit():
+        return False, _normalizar_erro(
+            "validar_receita", 
+            "receita_codigo deve ser estritamente numérico", 
+            f"O valor informado ('{codigo_arrecadacao}') contém letras ou caracteres inválidos. No PR, não se usa o label/nome do tributo (ex: 'ICMS NORMAL'). Use **apenas** o código numérico interno (ex: '1015')."
+        )
+        
+    referencia = dados_emissao.get("referencia")
+    if not referencia:
+        return False, _normalizar_erro("validar_entrada", "campo 'referencia' é obrigatório par PR")
+    data_pagamento = dados_emissao.get("data_pagamento") or dados_emissao.get("data_vencimento")
     unidade_gestora = dados_emissao.get("unidade_gestora", "990000")
     
-    valor = dados_emissao.get("valor", 10.00)
-    if isinstance(valor, str):
-        try: valor_float = float(valor.replace(".", "").replace(",", "."))
-        except: valor_float = 10.00
-    else:
-        valor_float = float(valor)
+    valor_cru = dados_emissao.get("valor", 0.0)
+    try: 
+        valor_float = float(str(valor_cru).replace(",", ".")) if valor_cru else 0.0
+    except ValueError: 
+        valor_float = 0.0
+        
+    if not data_pagamento or valor_float <= 0:
+        return False, "etapa: validar_entrada | motivo: obrigatorios pendentes | detalhe: data_pagamento/data_vencimento e valor (>0) sao imprescindiveis, sem defaults."
         
     if not path_pdf:
         path_pdf = "./pdfs_pr"
-        
-    if not referencia:
-        referencia = datetime.now().strftime("%m/%Y")
         
     # Validar
     try:
@@ -529,7 +595,14 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         
         if twocaptcha_key:
             try:
-                from ufs.solver_2captcha import resolver_recaptcha_enterprise
+                try:
+                    from .solver_2captcha import resolver_recaptcha_enterprise
+                except ImportError:
+                    try:
+                        from solver_2captcha import resolver_recaptcha_enterprise
+                    except ImportError:
+                        from ufs.solver_2captcha import resolver_recaptcha_enterprise
+                
                 logger.info("Resolvendo reCAPTCHA Enterprise via 2Captcha (sitekey=%s)...", sitekey)
                 re_captcha_token = resolver_recaptcha_enterprise(
                     api_key=twocaptcha_key,
@@ -642,6 +715,11 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         except ValueError as exc:
             return False, str(exc)
 
+        try: from .pdf_utils import validar_pdf
+        except ImportError: from pdf_utils import validar_pdf
+        is_valido, msg_val = validar_pdf(caminho)
+        if not is_valido: return False, _normalizar_erro("validar_pdf_final", "falsificacao de bytes ou arquivo corrompido", msg_val)
+
         logger.info("Emissão concluída: %s", caminho)
         return True, {
             "mensagem": "ok",
@@ -657,26 +735,39 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         session.close()
 
 if __name__ == "__main__":
-    CAD_TESTE = "12345678"  # CAD/ICMS de teste (substituir por válido)
-    PASTA_PDF = "./pdfs_pr"
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
 
     print("=" * 60)
-    print("  TESTE — Emissão de GR-PR")    # Teste de execução
-    pdf = str(Path("pdfs_pr").resolve() / "DAR1_PR_TEST.pdf")
+    print("  TESTE DIRETO — Emissão de GR-PR (ICMS) — PR")
+    print("=" * 60)
+    if not os.getenv("TWOCAPTCHA_API_KEY"):
+        print("[!] AVISO IMPORTANTE: A chave TWOCAPTCHA_API_KEY não foi encontrada no .env")
+        print("    A emissão via Playwright exigirá resolução manual do reCAPTCHA Enterprise se não configurado.")
+    
+    CAD_TESTE = "9017315606"  # CAD/ICMS de teste (substituir por válido em prod)
+    PASTA_PDF = "./pdfs_pr"
+    pdf_obj = Path(PASTA_PDF).resolve() / "DAR1_PR_TEST.pdf"
+
+    # Este payload obedece estritamente ao CONTRATO_PR (sem fallbacks de data)
+    dados_emissao = {
+    "ie_cnpj": "9017315606",
+    "receita_codigo": "1015",
+    "referencia": "02/2026",
+    "data_pagamento": "30/03/2026",
+    "valor": 10.00
+    }
+    
+    print(f"\n[>] Iniciando motor PR com IE/CAD {CAD_TESTE}...\n")
     sucesso, resultado = emitir(
-        dados_emissao={
-            "cad_icms": "9017315606",
-            "receita_codigo": "1015",
-            "referencia": "02/2026",
-            "data_vencimento": "23/03/2026",
-            "valor": 10.00
-        },
-        path_pdf=pdf
+        dados_emissao=dados_emissao,
+        path_pdf=str(pdf_obj)
     )
 
     if sucesso:
-        print(f"\n[v] SUCESSO")
-        print(f"   PDF: {resultado['pdf_path']}")
-        print(f"   Nome: {resultado['pdf_filename']}")
+        print(f"\n[SUCESSO] Guia Emitida!")
+        print(f"  -> PDF Salvo em: {resultado['pdf_path']}")
     else:
-        print(f"\n[x] ERRO: {resultado}")
+        print(f"\n[FALHA] A automação foi interrompida:\n  -> Motivo: {resultado}")
+    print("=" * 60)

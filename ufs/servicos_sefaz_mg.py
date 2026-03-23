@@ -2,7 +2,7 @@
 Módulo — Emissão de DAE (ICMS) para Minas Gerais (MG).
 Portal: SIARE — https://www2.fazenda.mg.gov.br/
 
-Fluxo REAL mapeado via browser/DevTools (04/03/2026):
+Fluxo REAL mapeado via browser/DevTools (04/03/2026, atualizado 23/03/2026):
   1. GET  /arrecadacao/ctrl/ARRECADA/ARRECADA/DOCUMENTO_ARRECADACAO?ACAO=VISUALIZAR
        → página de seleção de Grupo de Receita (cookies JSESSIONID + COOKIE_SESSAO_WEB)
         → seleciona grupo ICMS (ex: "ICMS APURADO NO PERIODO")
@@ -10,20 +10,40 @@ Fluxo REAL mapeado via browser/DevTools (04/03/2026):
   3. POST /arrecadacao/ctrl/ARRECADA/ARRECADA/DAE_ICMS  (ACAO=EXIBIRFLT)
        → pesquisa contribuinte por CNPJ/IE (txtIdentificacao)
        → popula nome, UF, município, dropdown de receitas
-  4. POST /arrecadacao/ctrl/ARRECADA/ARRECADA/DAE_ICMS  (ACAO=GERARDAE)
-       → envia dados completos → retorna PDF ou tela de confirmação
+  3.5 POST /arrecadacao/ctrl/ARRECADA/ARRECADA/DAE_ICMS  (ACAO=CALCULAR)
+       → SOMENTE quando guia vencida (data_pagamento > data_vencimento)
+       → portal calcula multa, juros e total; retorna nos campos txtMulta, txtJuros, txtTotal
+  4. POST /arrecadacao/ctrl/ARRECADA/ARRECADA/DAE_ICMS  (ACAO=PAGAVIANET)
+       → envia dados completos (com multa/juros se vencida) → retorna tela de confirmação/PDF
 
-Campos do formulário (form name="formTela"):
-  - cmbTipoIdentificacao: "1" (CNPJ), "2" (CPF) ou "3" (Inscrição Estadual)
-  - txtIdentificacao: Documento formatado
-  - cmbReceita: código de receita (dropdown populado após PESQUISAR)
-  - dtVencimento: DD/MM/AAAA
-  - dtPagamento: DD/MM/AAAA
-  - cmbPeriodo / cmbMes / cmbAno: período de referência
-  - txtNumeroDocumento: nº do documento de origem
-  - txtReceita: valor principal (R$)
-  - txtMulta / txtJuros: multa e juros
-  - txtInformacoesComplementares: texto livre
+CONTRATO DE ENTRADA (dados_emissao):
+  Regras de Preenchimento:
+  - ie_cnpj (Obrigatório): Documento ativo.
+  - receita_codigo (Obrigatório): Exato código/grupo da receita. Se não existir na IE procurada, 
+    retorna erro listando as opções reais (não faz fallback de índice).
+  - valor (Obrigatório): Deve ser > 0.
+  - referencia (Obrigatório): Formato MM/AAAA. Sem fallback/preenchimento silencioso.
+  - data_vencimento (Obrigatório): Formato DD/MM/AAAA. Sem fallback silencioso.
+  - data_pagamento (Opcional): Se ausente, assume 'data_vencimento'. Formato DD/MM/AAAA.
+
+  Exemplo Válido (Payload aceito):
+  {
+      "ie_cnpj": "062307904.00-81",
+      "receita_codigo": "ICMS MINEIRAIS",
+      "valor": 500,
+      "referencia": "01/2026",
+      "data_vencimento": "20/02/2026",
+      "data_pagamento": "23/03/2026"
+  }
+  
+  Exemplo Inválido (Esperado ValueError):
+  {
+      "ie_cnpj": "062307904.00-81",
+      "receita_codigo": "ICMS MINEIRAIS",
+      "valor": 500,
+      # Falhou por não informar 'referencia' ou 'data_vencimento'
+  }
+  Erro retornado: ValueError do tipo "motivo: data_vencimento ausente ou formato inválido"
 
 Retorno padronizado:
   Sucesso: True, {"mensagem": "ok", "pdf_path": "...", "pdf_filename": "..."}
@@ -131,14 +151,29 @@ def _extrair_opcoes_select(html: str, nome_campo: str) -> list:
 def _validar_entradas(
     ie_cnpj: str,
     valor: float,
+    receita_codigo: str,
+    referencia: str,
+    data_vencimento: str,
 ) -> None:
     if not ie_cnpj or not ie_cnpj.strip():
         raise ValueError(
             _normalizar_erro("validar_entrada", "IE/CNPJ ausente")
         )
-    if valor <= 0:
+    if not valor or valor <= 0:
         raise ValueError(
-            _normalizar_erro("validar_entrada", "valor deve ser > 0")
+            _normalizar_erro("validar_entrada", "valor inválido ou ausente", "valor deve ser > 0")
+        )
+    if not receita_codigo or not receita_codigo.strip():
+        raise ValueError(
+            _normalizar_erro("validar_entrada", "receita_codigo ausente")
+        )
+    if not referencia or not re.match(r"^\d{2}/\d{4}$", referencia):
+        raise ValueError(
+            _normalizar_erro("validar_entrada", "referencia ausente ou formato inválido", "esperado MM/AAAA")
+        )
+    if not data_vencimento or not re.match(r"^\d{2}/\d{2}/\d{4}$", data_vencimento):
+        raise ValueError(
+            _normalizar_erro("validar_entrada", "data_vencimento ausente ou formato inválido", "esperado DD/MM/AAAA")
         )
 
 # ---------------------------------------------------------------------------
@@ -154,45 +189,52 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
     ie_cnpj = dados_emissao.get("ie_cnpj") or dados_emissao.get("ie") or dados_emissao.get("cnpj", "")
     codigo_receita = dados_emissao.get("receita_codigo", "")
     referencia = dados_emissao.get("referencia", "")
-    valor = dados_emissao.get("valor", 10.00)
+    valor = dados_emissao.get("valor", 0.0)
     info_complementares = dados_emissao.get("historico", "")
-    # Em MG o grupo é o "ICMS APURADO NO PERIODO" se não especificado, ou podemos tentar buscar 
     grupo_icms = dados_emissao.get("grupo_icms", "apurado") 
     
     if isinstance(valor, str):
         try:
             valor_float = float(valor.replace(".", "").replace(",", "."))
-        except:
-            valor_float = 10.00
+        except ValueError:
+            valor_float = 0.0
     else:
-        valor_float = float(valor)
+        try:
+            valor_float = float(valor)
+        except (TypeError, ValueError):
+            valor_float = 0.0
 
     if not path_pdf:
         path_pdf = "./pdfs_mg"
         
-    agora = datetime.now()
-    data_vencimento = dados_emissao.get("data_vencimento") or agora.strftime("%d/%m/%Y")
-    data_pagamento = dados_emissao.get("data_pagamento") or agora.strftime("%d/%m/%Y")
+    data_vencimento = dados_emissao.get("data_vencimento", "")
+    data_pagamento = dados_emissao.get("data_pagamento", "") or data_vencimento
     
-    mes_referencia = ""
-    ano_referencia = ""
-    if referencia and "/" in referencia:
-        parts = referencia.split("/")
-        if len(parts) == 2:
-            mes_referencia = parts[0]
-            ano_referencia = parts[1]
-    
-    if not mes_referencia:
-        mes_referencia = str(int(agora.strftime("%m")))
-    elif mes_referencia.isdigit():
-        mes_referencia = str(int(mes_referencia))
-    if not ano_referencia:
-        ano_referencia = agora.strftime("%Y")
-
     try:
-        _validar_entradas(ie_cnpj, valor_float)
+        _validar_entradas(
+            ie_cnpj=ie_cnpj, 
+            valor=valor_float, 
+            receita_codigo=codigo_receita, 
+            referencia=referencia, 
+            data_vencimento=data_vencimento
+        )
     except ValueError as exc:
         return False, str(exc)
+
+    # Detectar se guia está vencida para acionar etapa CALCULAR MULTA/JUROS do portal
+    guia_vencida = False
+    try:
+        dt_venc = datetime.strptime(data_vencimento, "%d/%m/%Y")
+        dt_pag = datetime.strptime(data_pagamento, "%d/%m/%Y")
+        if dt_pag > dt_venc:
+            guia_vencida = True
+            logger.info("Guia vencida detectada (pag=%s > venc=%s). Será acionado CALCULAR MULTA/JUROS no portal.", data_pagamento, data_vencimento)
+    except ValueError:
+        pass  # Já validado na função anterior
+
+    parts = referencia.split("/")
+    mes_referencia = str(int(parts[0]))
+    ano_referencia = parts[1]
 
     # Validar grupo ICMS
     grupo_texto = GRUPOS_ICMS.get(grupo_icms)
@@ -347,20 +389,24 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
 
         if codigo_receita and opcoes_receita:
             codigo_match = ""
+            # Procura match exato do value ou match parcial do text
             for opt in opcoes_receita:
-                if codigo_receita.lower() in opt["value"].lower() or codigo_receita.lower() in opt["text"].lower():
+                if codigo_receita.lower() == opt["value"].lower() or codigo_receita.lower() in opt["text"].lower():
                     codigo_match = opt["value"]
                     break
-            codigo_receita = codigo_match or opcoes_receita[0]["value"]
-
-        if not codigo_receita and opcoes_receita:
-            codigo_receita = opcoes_receita[0]["value"]
-            logger.info("Receita auto-selecionada: %s (%s)", codigo_receita, opcoes_receita[0]["text"])
-
-        if not codigo_receita:
+            
+            if not codigo_match:
+                session.ultima_resposta = resp
+                return False, _normalizar_erro(
+                    "selecionar_receita",
+                    f"receita '{codigo_receita}' não encontrada para esta IE",
+                    f"opções: {[o['value'] + ' - ' + o['text'] for o in opcoes_receita]}"
+                )
+            codigo_receita = codigo_match
+        elif not opcoes_receita:
             session.ultima_resposta = resp
             return False, _normalizar_erro(
-                "pesquisar_contribuinte",
+                "selecionar_receita",
                 "nenhuma receita disponível após pesquisa da IE"
             )
 
@@ -386,8 +432,118 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
                 headers={**HEADERS_NAV, "Referer": URL_DAE_ICMS, "Content-Type": "text/plain"}
             )
             
-        logger.info("Etapa 4: Gerando DAE")
         valor_str = f"{valor_float:.2f}".replace(".", ",")
+
+        # Valores de multa/juros/total — preenchidos pelo portal se guia vencida
+        multa_portal = ""
+        juros_portal = ""
+        total_portal = valor_str
+
+        # ── Etapa 4: CALCULAR MULTA/JUROS (somente guia vencida) ────────────
+        if guia_vencida:
+            logger.info("Etapa 4: Calculando multa/juros via portal (guia vencida)")
+            payload_calcular = {
+                **inputs_form,
+                "unifwScrollTop": "0",
+                "unifwScrollLeft": "0",
+                "ACAO": "CALCULAR",
+                "cmbICMS": valor_select_icms or "1",
+                "cmbUF": cmb_uf,
+                "cmbMunicipio": cmb_mun,
+                "cmbTipoIdentificacao": tipo_doc,
+                "txtIdentificacao": doc_formatado,
+                "cmbReceita": codigo_receita,
+                "dtVencimento": data_vencimento,
+                "dtPagamento": data_pagamento,
+                "cmbPeriodo": "1",
+                "cmbMes": mes_referencia,
+                "cmbAno": ano_referencia,
+                "txtReceita": valor_str,
+                "txtMulta": "",
+                "txtJuros": "",
+                "txtTotal": valor_str,
+                "txtIDMulta": "400",
+                "txtIDJuros": "600",
+                "txtReceitaSelecionada": codigo_receita,
+                "txtTipoIdentificacaoDesabilitado": tipo_doc,
+                "txtInformacoes": info_complementares,
+            }
+
+            payload_calc_tuples = []
+            for k in [
+                'ACAO', 'unifwScrollTop', 'unifwScrollLeft', 'txtTela', 'txtDAESerializado',
+                'cmbTipoIdentificacao', 'txtIdentificacao', 'txtTipoIdentificacao',
+                'txtIdentificacaoContribuinte', 'txtNome', 'cmbUF', 'cmbMunicipio', 'cmbICMS',
+                'cmbReceita', 'dtVencimento', 'dtPagamento', 'cmbPeriodo', 'cmbMes', 'cmbAno',
+                'cmbTipoDocumentoOrigem', 'txtNumeroDocumento', 'txtReceita', 'txtMulta',
+                'txtJuros', 'txtTotal', 'txtIDMulta', 'txtIDJuros', 'txtInformacoes',
+                'txtIDSolicitante', 'txtItemSelecionado', 'txtICMSSelecionado', 'txtReceitaSelecionada',
+                'txtIDMulta', 'txtIDJuros', 'txtFlag', 'txtTipoDAE', 'txtTipoIdentificacaoDesabilitado',
+                'daeConsolidadosSerializado'
+            ]:
+                val = payload_calcular.get(k, "")
+                payload_calc_tuples.append((k, val))
+
+            payload_calc_encoded = urllib.parse.urlencode(payload_calc_tuples, encoding="iso-8859-1")
+
+            resp_calc = session.post(
+                URL_DAE_ICMS,
+                params={"ACAO": "CALCULAR"},
+                data=payload_calc_encoded,
+                headers={**HEADERS_NAV, "Referer": URL_DAE_ICMS, "Content-Type": "application/x-www-form-urlencoded"},
+                timeout=TIMEOUT,
+            )
+            resp_calc.raise_for_status()
+
+            # Salvar debug HTML para investigação
+            debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            with open(os.path.join(debug_dir, "mg_calcular_multa_juros.html"), "w", encoding="utf-8") as f:
+                f.write(resp_calc.text)
+            logger.info("Debug HTML de CALCULAR MULTA/JUROS salvo em debug/mg_calcular_multa_juros.html")
+
+            # Parsear resposta: extrair multa, juros e total dos campos do formulário
+            soup_calc = BeautifulSoup(resp_calc.text, "html.parser")
+            inputs_calc = _capturar_todos_inputs(resp_calc.text)
+
+            # Tentar extrair dos inputs do formulário retornado
+            multa_portal = inputs_calc.get("txtMulta", "")
+            juros_portal = inputs_calc.get("txtJuros", "")
+            total_portal = inputs_calc.get("txtTotal", "") or valor_str
+
+            # Fallback: buscar por value nos inputs diretamente
+            if not multa_portal:
+                inp_multa = soup_calc.find("input", {"name": "txtMulta"})
+                if inp_multa:
+                    multa_portal = inp_multa.get("value", "")
+            if not juros_portal:
+                inp_juros = soup_calc.find("input", {"name": "txtJuros"})
+                if inp_juros:
+                    juros_portal = inp_juros.get("value", "")
+            if not total_portal or total_portal == valor_str:
+                inp_total = soup_calc.find("input", {"name": "txtTotal"})
+                if inp_total and inp_total.get("value", ""):
+                    total_portal = inp_total.get("value", "")
+
+            # Verificar se o portal retornou erro
+            erro_calc = soup_calc.find(class_="msgErro")
+            if erro_calc:
+                msg_erro_calc = erro_calc.get_text(strip=True)
+                if msg_erro_calc:
+                    logger.warning("Portal retornou erro no cálculo: %s", msg_erro_calc)
+
+            logger.info(
+                "Multa/Juros retornados pelo portal: multa=%s, juros=%s, total=%s",
+                multa_portal or '(vazio)', juros_portal or '(vazio)', total_portal
+            )
+
+            # Atualizar inputs_form com os campos atualizados do portal (ViewState, etc.)
+            inputs_form = inputs_calc
+        else:
+            logger.info("Etapa 4: Guia não vencida — pulando cálculo de multa/juros")
+
+        # ── Etapa 5: Gerando DAE (GERAR PAGAMENTO) ────────────────
+        logger.info("Etapa 5: Gerando DAE")
 
         payload_gerar = {
             **inputs_form,
@@ -402,13 +558,13 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             "cmbReceita": codigo_receita,
             "dtVencimento": data_vencimento,
             "dtPagamento": data_pagamento,
-            "cmbPeriodo": "1", # 1 = Mensal
+            "cmbPeriodo": "1",
             "cmbMes": mes_referencia,
             "cmbAno": ano_referencia,
             "txtReceita": valor_str,
-            "txtMulta": "",
-            "txtJuros": "",
-            "txtTotal": valor_str,
+            "txtMulta": multa_portal,
+            "txtJuros": juros_portal,
+            "txtTotal": total_portal,
             "txtIDMulta": "400",
             "txtIDJuros": "600",
             "txtReceitaSelecionada": codigo_receita,
@@ -444,7 +600,7 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         )
         resp.raise_for_status()
 
-        # ── Etapa 5: Verificar resultado e Submeter Impressão PDF ────────────
+        # ── Etapa 6: Verificar resultado e Submeter Impressão PDF ────────────
         html_text = resp.text
         soup_sucesso = BeautifulSoup(html_text, "html.parser")
         
@@ -456,15 +612,15 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             if not msg_txt:
                 lbl_msg = soup_sucesso.find(id="lblMensagem")
                 msg_txt = lbl_msg.get_text(separator=" ", strip=True) if lbl_msg else "Falha não especificada."
-            _dbg = Path(__file__).resolve().parent / "debug"
-            _dbg.mkdir(parents=True, exist_ok=True)
-            with open(_dbg / "mg_debug_html.html", "w", encoding="utf-8") as f: f.write(html_text)
-            return False, f"etapa: 5_gerar | motivo: bloqueio | detalhe: {msg_txt}"
+            debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            with open(os.path.join(debug_dir, "mg_debug_html.html"), "w", encoding="utf-8") as f: f.write(html_text)
+            return False, f"etapa: 6_gerar | motivo: bloqueio | detalhe: {msg_txt}"
 
         numero_documento_gerado = lbl_num.get_text(strip=True)
         logger.info(f"DAE Gerado com Êxito! Número: {numero_documento_gerado}")
 
-        # ── Etapa 6: Baixar o PDF ────────────────────────────────────────────
+        # ── Etapa 7: Baixar o PDF ────────────────────────────────────────────
         form_imprimir = _capturar_todos_inputs(html_text)
         form_imprimir["ACAO"] = "VISUALIMPR"
         
@@ -487,7 +643,6 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             # No existing file should be named like the folder.
             if p_out.exists() and p_out.is_file():
                 # For safety, remove it if it's an obstructing file
-                import os
                 os.remove(p_out)
                 
             p_out.mkdir(parents=True, exist_ok=True)
@@ -496,6 +651,12 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             p_out = p_out / filename
             
             p_out.write_bytes(pdf_bytes)
+            
+            try: from .pdf_utils import validar_pdf
+            except ImportError: from pdf_utils import validar_pdf
+            is_valido, msg_val = validar_pdf(str(p_out.absolute()))
+            if not is_valido: return False, "etapa: validar_pdf_final | motivo: falsificacao de bytes ou arquivo corrompido | detalhe: " + msg_val
+            
             logger.info(f"Emissão concluída: {p_out.absolute()}")
             return True, {
                 "mensagem": "ok",
@@ -505,7 +666,7 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
             }
         else:
             session.ultima_resposta = resp_pdf
-            return False, "etapa: 6_baixar_pdf | motivo: retorno_invalido | detalhe: Rota de impressão não retornou binário do PDF"
+            return False, "etapa: 7_baixar_pdf | motivo: retorno_invalido | detalhe: Rota de impressão não retornou binário do PDF"
 
     except requests.RequestException as exc:
         return False, _normalizar_erro(
@@ -581,29 +742,35 @@ def listar_receitas(session=None, salvar_cache=True) -> dict:
         raise RuntimeError(str(e))
 
 if __name__ == "__main__":
-    IE_TESTE = "062308034001-7"
+    print("=" * 60)
+    print("  TESTE DIRETO — Emissão de DAE (ICMS) — MG")
+    print("=" * 60)
+    print("[!] AVISO: MG extrai o binário Base64 em tempo de execução submetida.\n")
+
+    IE_TESTE = "16.670.085/0001-55"
     PASTA_PDF = "./pdfs_mg"
 
-    print("=" * 60)
-    print("  TESTE — Emissão de DAE (ICMS) — MG")
-    print("=" * 60)
-
+    # Este payload obedece estritamente ao CONTRATO_MG
+    dados_emissao = {
+    "ie_cnpj": "062307904.00-81",
+    "receita_codigo": "101",
+    "referencia": "01/2026",
+    "data_vencimento": "20/02/2026",
+    "data_pagamento": "23/03/2026",
+    "valor": 500.00
+    }
+    
+    print(f"[>] Iniciando motor MG com CNPJ/IE {IE_TESTE}...\n")
     sucesso, resultado = emitir(
         session=None,
-        dados_emissao={
-            "ie_cnpj": "16.670.085/0001-55",
-            "receita_codigo": "ICMS APURADO NO PERIODO",
-            "valor": 10.00,
-            "data_vencimento": "23/03/2026",
-            "data_pagamento": "23/03/2026"
-        },
+        dados_emissao=dados_emissao,
         path_pdf=PASTA_PDF
     )
 
     if sucesso:
-        print(f"\n✅ SUCESSO")
-        print(f"   PDF: {resultado['pdf_path']}")
-        print(f"   Nome: {resultado['pdf_filename']}")
+        print(f"\n[SUCESSO] Guia Emitida!")
+        print(f"  -> PDF Salvo em: {resultado['pdf_path']}")
     else:
-        print(f"\n❌ ERRO: {resultado}")
+        print(f"\n[FALHA] A automação foi interrompida:\n  -> Motivo: {resultado}")
+    print("=" * 60)
 

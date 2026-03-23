@@ -16,6 +16,24 @@ Observações:
   - Dropdown de tributo populado via AJAX POST.
   - IE formato: 9 digitos sem formatação (ex: 133201040).
 
+CONTRATO DE ENTRADA (dados_emissao):
+  Principais campos exigidos:
+  - ie_cnpj: (obrigatório) Inscrição MT de 9 dígitos.
+  - receita_codigo: (obrigatório) Código/tributo.
+  - valor: (obrigatório) Valor principal da arrecadação.
+  - referencia: (obrigatório) MM/AAAA. Sem definições de fallback por segurança.
+  - data_vencimento: (obrigatório) Data validade atual do DAR original. Sem definições de fallback ocultos. MT bloqueia datas passadas para emissão do DAR.
+  - data_pagamento: (opcional) Caso presente e superior à data_vencimento, indica GUIA VENCIDA.
+  
+  CENÁRIO DE ATRASO (GUIA VENCIDA) NO MT (DAR LIVRE):
+  O portal não calcula juros e multa automaticamente! O cliente DEVE mandar o cálculo.
+  Quando `data_pagamento` for superior a `data_vencimento`:
+  1. A automação usará a `data_pagamento` como o campo 'dtVencimento' do portal 
+     (que no portal MT significa "Válido Para Pagamento Até").
+  2. A automação exigirá a presença do objeto `acrescimos` (contendo "multa", "juros", etc).
+  3. Se a guia for entendida como vencida e não houver `acrescimos`, aborta explicitamente
+     para não gerar PDF com valor principal frio (evita falso positivo financeiro).
+
 Retorno padronizado:
   Sucesso: True, {"mensagem": "ok", "pdf_path": "...", "pdf_filename": "..."}
   Erro:    False, "etapa: <nome> | motivo: <causa> | detalhe: <curto>"
@@ -101,6 +119,7 @@ def _validar_entradas(
     codigo_receita: str,
     referencia: str,
     valor: float,
+    data_vencimento: str,
 ) -> None:
     if not ie or not ie.strip():
         raise ValueError(_normalizar_erro("validar_entrada", "IE ausente"))
@@ -112,7 +131,14 @@ def _validar_entradas(
         raise ValueError(
             _normalizar_erro(
                 "validar_entrada",
-                "referência inválida (esperado MM/AAAA)",
+                "referência ausente ou inválida (esperado MM/AAAA)",
+            )
+        )
+    if not data_vencimento or not re.match(r"^\d{2}/\d{2}/\d{4}$", data_vencimento):
+        raise ValueError(
+            _normalizar_erro(
+                "validar_entrada",
+                "data_vencimento ausente ou inválida (esperado DD/MM/AAAA) - O portal exige este preenchimento explícito.",
             )
         )
     if valor <= 0:
@@ -128,16 +154,27 @@ def _baixar_pdf(
 ) -> Tuple[str, str]:
     """Valida resposta e salva PDF em disco."""
     content_type = resp.headers.get("Content-Type", "")
-    is_pdf = "application/pdf" in content_type.lower()
-    if not is_pdf and resp.content[:5] == b"%PDF-":
-        is_pdf = True
-
-    if not is_pdf:
+    content_bytes = resp.content
+    
+    if len(content_bytes) == 0:
+        raise ValueError(
+            _normalizar_erro("validar_pdf", "arquivo baixado possui 0 KB (vazio)")
+        )
+        
+    is_real_pdf = content_bytes[:5] == b"%PDF-"
+    if not is_real_pdf:
+        # Extrai um trecho do início da resposta para análise e log de erro claro
+        snippet = content_bytes[:100].decode(errors="ignore").replace("\r", " ").replace("\n", " ").strip()
+        
+        # Salvar o HTML/Conteúdo inesperado para debug
+        with open("mt_debug_pdf_error.html", "wb") as f_dbg:
+            f_dbg.write(content_bytes)
+            
         raise ValueError(
             _normalizar_erro(
-                "baixar_pdf",
-                "resposta não é PDF",
-                f"content-type={content_type}",
+                "validar_pdf",
+                "conteúdo baixado não corresponde a um PDF real",
+                f"content-type={content_type} | header_encontrado: {snippet}"
             )
         )
 
@@ -156,9 +193,9 @@ def _baixar_pdf(
     if destino.is_dir() or not str(destino).lower().endswith(".pdf"):
         destino = destino / filename
     destino.parent.mkdir(parents=True, exist_ok=True)
-    destino.write_bytes(resp.content)
+    destino.write_bytes(content_bytes)
 
-    logger.info("PDF salvo em %s (%d bytes)", destino, len(resp.content))
+    logger.info("PDF salvo e validado em %s (%d bytes)", destino, len(content_bytes))
     return str(destino), filename
 
 
@@ -183,16 +220,52 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
     ie = dados_emissao.get("ie") or dados_emissao.get("ie_cnpj", "")
     codigo_receita = dados_emissao.get("receita_codigo", "")
     referencia = dados_emissao.get("referencia", "")
-    data_vencimento = dados_emissao.get("data_vencimento") or datetime.now().strftime("%d/%m/%Y")
+    data_vencimento = dados_emissao.get("data_vencimento", "")
+    data_pagamento = dados_emissao.get("data_pagamento", "")
+    
+    # Tratamento realístico de vencimento/pagamento (Cenário de Atraso e Encargos MT)
+    data_limite_portal = data_vencimento
+    acrescimos = dados_emissao.get("acrescimos") or {}
+    
+    # Converter lista de dicionários para dicionário simples (suporte a ambos os formatos)
+    if isinstance(acrescimos, list):
+        novo_acrescimos = {}
+        for item in acrescimos:
+            if isinstance(item, dict) and "tipo" in item and "valor" in item:
+                novo_acrescimos[item["tipo"].lower()] = item["valor"]
+        acrescimos = novo_acrescimos
+        
+    if data_pagamento and data_vencimento:
+        try:
+            dt_v = datetime.strptime(data_vencimento, "%d/%m/%Y")
+            dt_p = datetime.strptime(data_pagamento, "%d/%m/%Y")
+            if dt_p > dt_v:
+                # É um cenário vencido!
+                # MT portal "dataVencimento" field means the ORIGINAL Due Date! 
+                # So we keep data_limite_portal = data_vencimento.
+                
+                # Validação de Segurança de Encargos
+                if not acrescimos:
+                    return False, _normalizar_erro(
+                        "validar_acrescimos", 
+                        "guia vencida exige encargos manuais", 
+                        "O portal do MT (DAR Livre) não calcula multa/juros automaticamente. Você forneceu data de pagamento atrasada; é **obrigatório** passar o sub-objeto 'acrescimos' com os valores computados para não emitirmos uma guia defasada apenas com o valor original."
+                    )
+        except ValueError:
+            pass # será capitulada pelo _validar_entradas
+            
     informacao_prevista = dados_emissao.get("historico", "")
     tipo_venda = dados_emissao.get("tipo_venda", "1")
     
-    valor = dados_emissao.get("valor", "10,00")
+    valor = dados_emissao.get("valor")
+    if not valor:
+        return False, _normalizar_erro("validar_receita", "valor ausente", "é obrigatório informar o 'valor'")
+        
     if isinstance(valor, str):
         try:
             valor_float = float(valor.replace(".", "").replace(",", "."))
-        except:
-            valor_float = 10.00
+        except ValueError:
+            return False, _normalizar_erro("validar_receita", "valor inválido", "formato de valor não numérico")
     else:
         valor_float = float(valor)
         
@@ -202,11 +275,8 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
     if not path_pdf:
         path_pdf = "./pdfs_mt"
 
-    if not referencia:
-        referencia = datetime.now().strftime("%m/%Y")
-
     try:
-        _validar_entradas(ie, codigo_receita, referencia, valor_float)
+        _validar_entradas(ie, codigo_receita, referencia, valor_float, data_vencimento)
     except ValueError as exc:
         return False, str(exc)
 
@@ -322,12 +392,9 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         all_fields["inscricaoEstadual"] = ie_limpa
         all_fields["valorCampo"] = valor_str
         all_fields["valor"] = valor_str  # campo hidden que o servidor valida
-        all_fields["dataVencimento"] = data_vencimento
+        all_fields["dataVencimento"] = data_limite_portal
         all_fields["informacaoPrevista"] = informacao_prevista
         all_fields["notas"] = "1"
-        
-        # Acrescentes
-        acrescimos = dados_emissao.get("acrescimos", {})
         
         precisa_juros = False
         precisa_multa = False
@@ -374,44 +441,71 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         if captcha:
             return False, msg_captcha
 
-        # Verificar erros na resposta HTML
+        # Verificar erros explícitos
         if "Página de Erros" in resp.text or "operação inexistente" in resp.text:
             soup = BeautifulSoup(resp.text, "html.parser")
             erro_el = soup.find("td", class_="textoVermelho")
             detalhe = erro_el.get_text(separator=" ", strip=True)[:300] if erro_el else soup.get_text(separator=" ", strip=True)[:300]
 
-            # Validação específica exigida se o portal exigir e o valor não for fornecido
             if "juros" in detalhe.lower() or "multa" in detalhe.lower() or "atualização" in detalhe.lower() or "correção" in detalhe.lower() or "obrigatório" in detalhe.lower() and ("multa" in detalhe.lower() or "juros" in detalhe.lower()):
                 return False, _normalizar_erro("validar_acrescimos", "campo obrigatório ausente", "juros/multa/correcao | portal exige e nao foi repassado. Detalhe: " + detalhe)
 
-            return False, _normalizar_erro(
-                "emitir_dar", "portal retornou erro", detalhe
-            )
+            return False, _normalizar_erro("emitir_dar", "portal retornou erro", detalhe)
 
-        # ── Etapa 5: Baixar PDF via GET /impirmirdar ─────────────────────
-        logger.info("Etapa 5: Baixando PDF gerado")
-        resp_pdf = session.get(
-            URL_IMPRIMIR + "?chavePix=true",
-            headers={**HEADERS_NAV, "Referer": URL_PJ},
-            timeout=TIMEOUT,
-        )
-        resp_pdf.raise_for_status()
+        # Verificar sucesso real buscando o iframe do PDF
+        soup_emitir = BeautifulSoup(resp.text, "html.parser")
+        iframe_pdf = soup_emitir.find("iframe")
+        pdf_url_relativo = iframe_pdf.get("src") if iframe_pdf else None
+        
+        if not pdf_url_relativo:
+            # Não tem iframe do PDF, logo falhou silenciosamente
+            # Extrair algum possível texto de erro genérico se houver
+            erro_td = soup_emitir.find("td", class_="textoVermelho")
+            txt_erro = erro_td.get_text(strip=True) if erro_td else "Falha desconhecida. Iframe do PDF não encontrado na página de sucesso."
+            return False, _normalizar_erro("emitir_dar", "emissão não gerou PDF no portal", txt_erro[:200])
 
-        try:
-            caminho, nome_arquivo = _baixar_pdf(resp_pdf, path_pdf)
-        except ValueError:
-            # Tentar sem o chavePix param
-            resp_pdf2 = session.get(
-                URL_IMPRIMIR,
+        if pdf_url_relativo.startswith("http"):
+            pdf_url_final = pdf_url_relativo
+        else:
+            pdf_url_final = "https://www.sefaz.mt.gov.br" + pdf_url_relativo
+
+        # ── Etapa 5: Baixar PDF via GET dinâmico com Polling/Retries ─────────────
+        logger.info(f"Etapa 5: Emissão concluída. Iniciando download da URL ({pdf_url_final}) com polling...")
+        
+        import time
+        max_tentativas = 3
+        caminho, nome_arquivo = None, None
+        
+        for tentativa in range(1, max_tentativas + 1):
+            if tentativa > 1:
+                logger.info(f"Aguardando 2 segundos antes da tentativa {tentativa} de download do PDF...")
+                time.sleep(2)
+                
+            resp_pdf = session.get(
+                pdf_url_final,
                 headers={**HEADERS_NAV, "Referer": URL_PJ},
                 timeout=TIMEOUT,
             )
-            try:
-                caminho, nome_arquivo = _baixar_pdf(resp_pdf2, path_pdf)
-            except ValueError as exc2:
-                return False, str(exc2)
+            resp_pdf.raise_for_status()
 
-        logger.info("Emissão concluída com sucesso: %s", caminho)
+            try:
+                caminho, nome_arquivo = _baixar_pdf(resp_pdf, path_pdf)
+                break # Sucesso, sai do loop
+            except ValueError as ext_val:
+                if "0 KB" in str(ext_val) and tentativa < max_tentativas:
+                    logger.warning(f"Download retornou 0 KB na tentativa {tentativa}. O PDF pode ainda estar sendo gerado no servidor.")
+                    continue
+                else:
+                    if tentativa == max_tentativas:
+                        return False, str(ext_val) # Retorna erro na última tentativa
+                    continue
+
+        try: from .pdf_utils import validar_pdf
+        except ImportError: from pdf_utils import validar_pdf
+        is_valido, msg_val = validar_pdf(caminho)
+        if not is_valido: return False, _normalizar_erro("validar_pdf_final", "falsificacao de bytes ou HTML incorreto", msg_val)
+
+        logger.info("Etapa 6: PDF extraído dinamicamente, salvo e validado com sucesso. Fluxo concluído.")
         return True, {
             "mensagem": "ok",
             "pdf_path": caminho,
@@ -508,20 +602,29 @@ def listar_receitas(session=None, salvar_cache=True) -> dict:
 # Teste embutido
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # IE pública do MT para testes (EDSON MARCOS MELOZZI)
+    print("=" * 60)
+    print("  TESTE DIRETO — Emissão de DAR-1 Livre — MT")
+    print("=" * 60)
+    print("[!] AVISO: MT utiliza processamento direto HTTP (Requests). Sem restrição por Captcha.\n")
+
     IE_TESTE = "133201040"
     PASTA_PDF = "./pdfs_mt"
 
-    print("=" * 60)
-    print("  TESTE — Emissão de DAR-1 (ICMS) — MT")
-    print("=" * 60)
-
+    # Este payload obedece estritamente ao CONTRATO_MT
     dados_emissao = {
-        "ie": IE_TESTE,
-        "receita_codigo": "1112",
-        "valor": 10.00
+    "ie": "133201040",
+    "receita_codigo": "1112",
+    "referencia": "03/2026",
+    "data_vencimento": "25/03/2026",
+    "data_pagamento": "28/03/2026",
+    "valor": 10.00,
+    "acrescimos": [
+        {"tipo": "juros", "valor": 1.50},
+        {"tipo": "multa", "valor": 0.50}
+    ]
     }
 
+    print(f"[>] Iniciando motor MT com IE {IE_TESTE}...\n")
     sucesso, resultado = emitir(
         session=None,
         dados_emissao=dados_emissao,
@@ -529,10 +632,8 @@ if __name__ == "__main__":
     )
 
     if sucesso:
-        print(f"\n✅ SUCESSO")
-        print(f"   PDF: {resultado['pdf_path']}")
-        print(f"   Nome: {resultado['pdf_filename']}")
+        print(f"\n[SUCESSO] Guia Emitida!")
+        print(f"  -> PDF Salvo em: {resultado['pdf_path']}")
     else:
-        print(f"\n❌ ERRO: {resultado}")
-
+        print(f"\n[FALHA] A automação foi interrompida:\n  -> Motivo: {resultado}")
     print("=" * 60)
