@@ -316,7 +316,16 @@ def _emitir_via_playwright(
             valor_input.fill("")
             valor_input.type(valor_fmt, delay=50)
 
-            _select_vue_multiselect(page, "#id_0_6", data_pagamento)
+            try:
+                _select_vue_multiselect(page, "#id_0_6", data_pagamento)
+            except ValueError:
+                raise ValueError(
+                    _normalizar_erro(
+                        "selecionar_data_pagamento",
+                        f"opção '{data_pagamento}' não encontrada no dropdown",
+                        "a data informada não está disponível no portal do PR"
+                    )
+                )
             page.wait_for_timeout(1000)
 
             btn_avancar2 = page.locator("button:has-text('Avançar')").first
@@ -566,6 +575,18 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         if sucesso:
             return sucesso, retorno
         else:
+            # Erros de formulário/dropdown (ex: data indisponível) não devem
+            # cair no fallback da API — retornar a causa real imediatamente
+            _erros_sem_fallback = [
+                "não encontrada no dropdown",
+                "nao encontrada no dropdown",
+                "opção exata",
+                "opcao exata",
+            ]
+            retorno_lower = str(retorno).lower()
+            if any(padrao in retorno_lower for padrao in _erros_sem_fallback):
+                logger.warning("Falha no Playwright por erro de formulário (%s). Retornando sem fallback.", retorno)
+                return False, retorno
             logger.warning("Falha no Playwright (%s). Tentando via API original...", retorno)
     except ImportError:
         logger.info("Playwright não encontrado. Usando interface API HTTP padrão...")
