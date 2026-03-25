@@ -167,6 +167,7 @@ def _validar_entradas(
     referencia: str,
     valor: float,
     tipo_referencia: str,
+    data_pagamento: str = "",
 ) -> None:
     if not ie_cnpj or not ie_cnpj.strip():
         raise ValueError(
@@ -194,6 +195,38 @@ def _validar_entradas(
         raise ValueError(
             _normalizar_erro("validar_entrada", "valor deve ser > 0")
         )
+
+    # ── Validação de data_pagamento (regra GO: não pode ser inferior à data atual) ──
+    if data_pagamento:
+        if not re.match(r"^\d{2}/\d{2}/\d{4}$", data_pagamento):
+            raise ValueError(
+                _normalizar_erro(
+                    "validar_entrada",
+                    "data_pagamento inválida",
+                    "formato esperado: DD/MM/AAAA",
+                )
+            )
+        try:
+            dt_pagamento = datetime.strptime(data_pagamento, "%d/%m/%Y").date()
+        except ValueError:
+            raise ValueError(
+                _normalizar_erro(
+                    "validar_entrada",
+                    "data_pagamento inválida",
+                    f"não foi possível interpretar '{data_pagamento}' como DD/MM/AAAA",
+                )
+            )
+        hoje = datetime.now().date()
+        if dt_pagamento < hoje:
+            raise ValueError(
+                _normalizar_erro(
+                    "validar_entrada",
+                    "data_pagamento inválida",
+                    f"no estado de GO, a data de pagamento não pode ser inferior à data atual "
+                    f"(data_pagamento={data_pagamento}, hoje={hoje.strftime('%d/%m/%Y')})",
+                )
+            )
+
 
 def _detectar_login_ou_captcha(resp: requests.Response) -> bool:
     """Verifica se o portal redirecionou para login ou exibe captcha."""
@@ -799,7 +832,7 @@ def preparar_modo_assistido(
         data_vencimento = datetime.now().strftime("%d/%m/%Y")
 
     try:
-        _validar_entradas(ie_cnpj, codigo_receita, referencia, valor, tipo_referencia)
+        _validar_entradas(ie_cnpj, codigo_receita, referencia, valor, tipo_referencia, data_pagamento=data_pagamento)
     except ValueError as exc:
         return False, str(exc)
 
@@ -905,7 +938,7 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         path_pdf = "./pdfs_go"
         
     try:
-        _validar_entradas(ie_cnpj, codigo_receita, referencia, valor_float, tipo_referencia)
+        _validar_entradas(ie_cnpj, codigo_receita, referencia, valor_float, tipo_referencia, data_pagamento=data_pagamento)
     except ValueError as exc:
         return False, str(exc)
 
@@ -952,11 +985,12 @@ def emitir(session=None, dados_emissao: dict = None, path_pdf: str = "") -> Resu
         if sucesso:
             return sucesso, retorno
         else:
-            # Classificar: se o erro é de VALIDAÇÃO do portal, não tenta fallback
-            if _erro_e_de_validacao(retorno):
+            # Classificar: se o erro é de VALIDAÇÃO do portal (contribuinte ou data),
+            # não tenta fallback — impede captcha/fallback por erros já conhecidos
+            if _erro_e_de_validacao(retorno) or "data de pagamento" in str(retorno).lower():
                 logger.warning(
-                    "Falha no Playwright (etapa: identificar_contribuinte | "
-                    "motivo: erro do portal (validação) | detalhe: %s). "
+                    "Falha no Playwright (etapa: validação do portal | "
+                    "motivo: erro de validação | detalhe: %s). "
                     "Retornando sem fallback.", retorno,
                 )
                 return False, retorno
